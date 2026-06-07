@@ -35,6 +35,12 @@ def init_db():
                     data JSONB,
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS paid_marks (
+                    user_id BIGINT NOT NULL,
+                    person_key TEXT NOT NULL,
+                    paid_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (user_id, person_key)
+                );
             """)
         conn.commit()
 
@@ -78,6 +84,38 @@ def db_save_phones(uid, data):
                 ON CONFLICT (user_id) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
             """, (uid, Json(data)))
         conn.commit()
+
+# ── Paid marks DB ────────────────────────────────────────────────────────────
+def db_get_paid(uid):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT person_key FROM paid_marks WHERE user_id=%s", (uid,))
+            return {row[0] for row in cur.fetchall()}
+
+def db_mark_paid(uid, key):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO paid_marks (user_id, person_key) VALUES (%s,%s) ON CONFLICT DO NOTHING", (uid, key))
+        conn.commit()
+
+def db_unmark_paid(uid, key):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM paid_marks WHERE user_id=%s AND person_key=%s", (uid, key))
+        conn.commit()
+
+def db_clear_paid(uid):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM paid_marks WHERE user_id=%s", (uid,))
+        conn.commit()
+
+def make_person_key(r):
+    # Use account number as primary key, fallback to name+addr
+    acc = str(r.get("account","") or r.get("passport","") or "").strip()
+    if acc:
+        return "ACC|" + acc
+    return r["name"] + "|" + norm_addr(r.get("address",""))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def norm_addr(addr: str) -> str:
@@ -140,14 +178,16 @@ def build_all_rows(vedomosti, phone_book):
     grouped = {}
     for v in vedomosti:
         for r in v.get("rows", []):
-            key = r["name"] + "|" + norm_addr(r.get("address",""))
+            key = make_person_key(r)
             if key not in grouped:
                 grouped[key] = {
                     "name": r["name"],
                     "address": r.get("address",""),
                     "passport": r.get("passport",""),
+                    "account": r.get("account",""),
                     "phone": find_phone(phone_book, r.get("address","")),
-                    "veds": []
+                    "veds": [],
+                    "_key": key
                 }
             grouped[key]["veds"].append({
                 "type": v.get("vedomist_type","?"),
@@ -157,18 +197,26 @@ def build_all_rows(vedomosti, phone_book):
             })
     return list(grouped.values())
 
-def format_rows(rows, phone_book):
+def format_rows(rows, phone_book, paid=None):
+    if paid is None: paid = set()
     chunks = []
     current = ""
     for i, r in enumerate(rows, 1):
+        key   = make_person_key(r)
+        is_paid = key in paid
         addr  = r["address"].replace("Сошичне, ","").replace(";;","").strip()
         phone = r.get("phone","") or find_phone(phone_book, r["address"])
         veds_str = " ".join([f"В{v['type']}·{v['dil']}" for v in r["veds"]])
         pays_str = " / ".join([f"{fmt_hrn(v.get('sum',0))} · {v['pay_date']}" for v in r["veds"]])
 
-        line = f"{i}. {r['name']}\n   📍 {addr}\n"
-        if phone: line += f"   📞 {phone}\n"
-        line += f"   📋 {veds_str}\n   💰 {pays_str}\n   🪪 {r['passport']}\n\n"
+        account = r.get("account","")
+        acc_str = f"   🔢 {account}\n" if account else ""
+        if is_paid:
+            line = f"{i}. ✅ {r['name']}\n   📍 {addr}\n   💰 {pays_str}\n{acc_str}\n"
+        else:
+            line = f"{i}. {r['name']}\n   📍 {addr}\n"
+            if phone: line += f"   📞 {phone}\n"
+            line += f"   📋 {veds_str}\n   💰 {pays_str}\n   🪪 {r['passport']}\n{acc_str}\n"
 
         if len(current) + len(line) > 3800:
             chunks.append(current)
@@ -182,7 +230,8 @@ def format_rows(rows, phone_book):
 async def ask_claude(b64: str) -> dict:
     prompt = """Це відомість ПФУ на виплату пенсій. Зчитай всі рядки таблиці з УСІХ сторінок.
 Поверни ТІЛЬКИ валідний JSON без markdown, без пояснень:
-{"vedomist_type":"99","period":"Червень 2026 01","dilinitsa":"50","rows":[{"name":"БАЛЕЦЬКИЙ ВОЛОДИМИР ПОРФИРІЙОВИЧ","address":"Сошичне, МИРУ, 94;;","sum":2301.28,"passport":"AC 000393421","pay_date":"04.06"}]}"""
+{"vedomist_type":"99","period":"Червень 2026 01","dilinitsa":"50","rows":[{"account":"001256811781","name":"БАЛЕЦЬКИЙ ВОЛОДИМИР ПОРФИРІЙОВИЧ","address":"Сошичне, МИРУ, 94;;","sum":2301.28,"passport":"AC 000393421","pay_date":"04.06"}]}
+- account: номер особового рахунку з першої колонки (довге число)"""
 
     async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
@@ -227,7 +276,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/today 07.06 — виплати до вказаної дати\n"
         "/search Шворак — пошук за прізвищем\n"
         "/clear — очистити всі відомості\n"
-        "/phones — статус телефонної книги"
+        "/phones — статус телефонної книги\n\n"
+        "Відмітки виплат:\n"
+        "/paid Шворак — відмітити як виплачено\n"
+        "/unpaid Шворак — зняти позначку\n"
+        "/unpaid_list — список невиплачених\n"
+        "/clear_paid — зняти всі позначки"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -256,8 +310,10 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     rows = build_all_rows(veds, phones)
     rows.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
-    await update.message.reply_text(f"📋 Зведений список · {len(rows)} осіб\n{'─'*28}")
-    for chunk in format_rows(rows, phones):
+    paid = db_get_paid(uid)
+    unpaid_count = sum(1 for r in rows if make_person_key(r) not in paid)
+    await update.message.reply_text(f"📋 Зведений список · {len(rows)} осіб · не виплачено: {unpaid_count}\n{'─'*28}")
+    for chunk in format_rows(rows, phones, paid):
         await update.message.reply_text(chunk)
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -285,8 +341,10 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     filtered.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in filtered)
-    await update.message.reply_text(f"📅 Виплати до {ctx.args[0]} · {len(filtered)} осіб · {fmt_hrn(total)}\n{'─'*28}")
-    for chunk in format_rows(filtered, phones):
+    paid = db_get_paid(uid)
+    unpaid = sum(1 for r in filtered if make_person_key(r) not in paid)
+    await update.message.reply_text(f"📅 Виплати до {ctx.args[0]} · {len(filtered)} осіб · не виплачено: {unpaid}\n💰 {fmt_hrn(total)}\n{'─'*28}")
+    for chunk in format_rows(filtered, phones, paid):
         await update.message.reply_text(chunk)
 
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -307,8 +365,9 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not found:
         await update.message.reply_text(f"🔍 Нічого не знайдено: {query}")
         return
+    paid = db_get_paid(uid)
     await update.message.reply_text(f"🔍 '{query}' · {len(found)} осіб\n{'─'*28}")
-    for chunk in format_rows(found, phones):
+    for chunk in format_rows(found, phones, paid):
         await update.message.reply_text(chunk)
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -405,6 +464,89 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/search Шворак або просто напиши прізвище"
     )
 
+def find_by_account_or_name(all_rows, query):
+    """Search by account number first, then by name"""
+    q = query.strip()
+    # Try exact account match
+    by_acc = [r for r in all_rows if r.get("account","") == q]
+    if by_acc: return by_acc
+    # Try partial name match
+    return [r for r in all_rows if q.upper() in r["name"].upper()]
+
+async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
+    if not veds:
+        await update.message.reply_text("📭 Відомостей немає.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("⚠️ Вкажи номер рахунку або прізвище:\n/paid 001256811781\n/paid Шворак")
+        return
+    query = " ".join(ctx.args).strip()
+    all_rows = build_all_rows(veds, phones)
+    found = find_by_account_or_name(all_rows, query)
+    if not found:
+        await update.message.reply_text(f"🔍 Не знайдено: {query}")
+        return
+    if len(found) > 1:
+        names = "\n".join([f"{i+1}. {r.get('account','')} {r['name']}" for i,r in enumerate(found)])
+        await update.message.reply_text(f"Знайдено кілька — вкажи номер рахунку:\n{names}")
+        return
+    r = found[0]
+    key = make_person_key(r)
+    db_mark_paid(uid, key)
+    await update.message.reply_text(f"✅ Виплачено: {r['name']}\n   🔢 {r.get('account','')}")
+
+async def cmd_unpaid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
+    if not veds:
+        await update.message.reply_text("📭 Відомостей немає.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("⚠️ Вкажи номер рахунку або прізвище:\n/unpaid 001256811781")
+        return
+    query = " ".join(ctx.args).strip()
+    all_rows = build_all_rows(veds, phones)
+    found = find_by_account_or_name(all_rows, query)
+    if not found:
+        await update.message.reply_text(f"🔍 Не знайдено: {query}")
+        return
+    if len(found) > 1:
+        names = "\n".join([f"{i+1}. {r.get('account','')} {r['name']}" for i,r in enumerate(found)])
+        await update.message.reply_text(f"Знайдено кілька — вкажи номер рахунку:\n{names}")
+        return
+    r = found[0]
+    key = make_person_key(r)
+    db_unmark_paid(uid, key)
+    await update.message.reply_text(f"↩️ Знято позначку: {r['name']}\n   🔢 {r.get('account','')}")
+
+async def cmd_unpaid_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
+    if not veds:
+        await update.message.reply_text("📭 Відомостей немає.")
+        return
+    all_rows = build_all_rows(veds, phones)
+    paid = db_get_paid(uid)
+    unpaid = [r for r in all_rows if make_person_key(r) not in paid]
+    unpaid.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
+    if not unpaid:
+        await update.message.reply_text("🎉 Всі виплати здійснено!")
+        return
+    total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in unpaid)
+    await update.message.reply_text(f"⏳ Не виплачено · {len(unpaid)} осіб · {fmt_hrn(total)}\n{'─'*28}")
+    for chunk in format_rows(unpaid, phones, paid):
+        await update.message.reply_text(chunk)
+
+async def cmd_clear_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    db_clear_paid(uid)
+    await update.message.reply_text("↩️ Всі позначки виплат знято")
+
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -413,7 +555,11 @@ def main():
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(CommandHandler("today",  cmd_today))
     app.add_handler(CommandHandler("search", cmd_search))
-    app.add_handler(CommandHandler("clear",  cmd_clear))
+    app.add_handler(CommandHandler("clear",      cmd_clear))
+    app.add_handler(CommandHandler("paid",        cmd_paid))
+    app.add_handler(CommandHandler("unpaid",      cmd_unpaid))
+    app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
+    app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
     app.add_handler(CommandHandler("phones", cmd_phones))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
