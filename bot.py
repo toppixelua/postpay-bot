@@ -150,14 +150,13 @@ def format_rows(rows: list, phone_book: dict) -> list:
         addr = r["address"].replace("Сошичне, ","").replace(";;","").strip()
         phone = r.get("phone","") or find_phone(phone_book, r["address"])
         veds_str = " ".join([f"В{v['type']}·{v['dil']}" for v in r["veds"]])
-        dates_str = " / ".join([f"{v['pay_date']}" for v in r["veds"]])
-        total_sum = sum(float(v.get("sum",0)) for v in r["veds"])
+        pays_str = " / ".join([f"{fmt_hrn(v.get('sum',0))} · {v['pay_date']}" for v in r["veds"]])
 
         line = f"{i}. {r['name']}\n   📍 {addr}\n"
         if phone:
             line += f"   📞 {phone}\n"
         line += f"   📋 {veds_str}\n"
-        line += f"   💰 {fmt_hrn(total_sum)} · 📅 {dates_str}\n   🪪 {r['passport']}\n\n"
+        line += f"   💰 {pays_str}\n   🪪 {r['passport']}\n\n"
 
         if len(current) + len(line) > 3800:
             chunks.append(current)
@@ -340,10 +339,47 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Помилка: {str(e)[:500]}")
 
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ud = get_ud(uid)
+    if not ud["vedomosti"]:
+        await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("⚠️ Вкажи прізвище: /search Шворак")
+        return
+    query = " ".join(ctx.args).upper().strip()
+    all_rows = build_all_rows(ud["vedomosti"], ud["phone_book"])
+    found = [r for r in all_rows if query in r["name"].upper()]
+    if not found:
+        await update.message.reply_text(f"🔍 Нічого не знайдено за запитом: {query}")
+        return
+    header = f"🔍 Результат пошуку '{query}' · {len(found)} осіб\n{'─'*28}\n"
+    chunks = format_rows(found, ud["phone_book"])
+    await update.message.reply_text(header)
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
+
 async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Try to use text as search query
+    uid = update.effective_user.id
+    ud = get_ud(uid)
+    text = update.message.text.strip().upper()
+    if len(text) >= 3 and ud["vedomosti"]:
+        all_rows = build_all_rows(ud["vedomosti"], ud["phone_book"])
+        found = [r for r in all_rows if text in r["name"].upper()]
+        if found:
+            header = f"🔍 '{update.message.text.strip()}' · {len(found)} осіб\n{'─'*28}\n"
+            chunks = format_rows(found, ud["phone_book"])
+            await update.message.reply_text(header)
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+            return
     await update.message.reply_text(
         "📄 Надішли PDF відомість або XLSX телефонну книгу\n\n"
-        "Команди: /list · /today 07.06 · /status · /clear"
+        "Команди:\n/list · /today 07.06 · /status · /clear\n"
+        "/search Шворак — пошук за прізвищем\n\n"
+        "Або просто напиши прізвище для пошуку"
     )
 
 def main():
@@ -354,6 +390,7 @@ def main():
     app.add_handler(CommandHandler("today",  cmd_today))
     app.add_handler(CommandHandler("clear",  cmd_clear))
     app.add_handler(CommandHandler("phones", cmd_phones))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
     print("Bot started")
