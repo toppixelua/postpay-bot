@@ -297,9 +297,12 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
     if not ctx.args:
-        await update.message.reply_text("⚠️ Вкажи прізвище: /search Шворак")
+        await update.message.reply_text("⚠️ Вкажи частину прізвища: /search Шв")
         return
     query = " ".join(ctx.args).upper().strip()
+    if len(query) < 2:
+        await update.message.reply_text("⚠️ Мінімум 2 літери")
+        return
     found = [r for r in build_all_rows(veds, phones) if query in r["name"].upper()]
     if not found:
         await update.message.reply_text(f"🔍 Нічого не знайдено: {query}")
@@ -386,7 +389,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip().upper()
-    if len(text) >= 3:
+    if len(text) >= 2:
         veds = db_get_vedomosti(uid)
         phones = db_get_phones(uid)
         if veds:
