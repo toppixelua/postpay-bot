@@ -2,25 +2,84 @@ import os, json, base64, re, io
 from datetime import datetime
 import httpx
 import openpyxl
+import psycopg2
+from psycopg2.extras import Json
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
+DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 
-# Storage per user
-# user_data[uid] = {
-#   "vedomosti": [...],   # list of parsed vedomist dicts
-#   "phone_book": {}      # norm_addr -> phone
-# }
-user_data = {}
+# ── Database ──────────────────────────────────────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
-def get_ud(uid):
-    if uid not in user_data:
-        user_data[uid] = {"vedomosti": [], "phone_book": {}}
-    return user_data[uid]
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS vedomosti (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    vedomist_type TEXT,
+                    dilinitsa TEXT,
+                    period TEXT,
+                    source_file TEXT,
+                    rows JSONB,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, vedomist_type, dilinitsa, period)
+                );
+                CREATE TABLE IF NOT EXISTS phone_books (
+                    user_id BIGINT PRIMARY KEY,
+                    data JSONB,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+        conn.commit()
 
-# ── Address normalization ─────────────────────────────────────────────────────
+def db_get_vedomosti(uid):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT vedomist_type, dilinitsa, period, source_file, rows FROM vedomosti WHERE user_id=%s ORDER BY created_at", (uid,))
+            rows = cur.fetchall()
+    return [{"vedomist_type":r[0],"dilinitsa":r[1],"period":r[2],"source_file":r[3],"rows":r[4]} for r in rows]
+
+def db_save_vedomist(uid, v):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO vedomosti (user_id, vedomist_type, dilinitsa, period, source_file, rows)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (user_id, vedomist_type, dilinitsa, period)
+                DO UPDATE SET rows=EXCLUDED.rows, source_file=EXCLUDED.source_file, created_at=NOW()
+            """, (uid, v.get("vedomist_type"), v.get("dilinitsa"), v.get("period"), v.get("source_file"), Json(v.get("rows",[]))))
+        conn.commit()
+
+def db_clear_vedomosti(uid):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM vedomosti WHERE user_id=%s", (uid,))
+        conn.commit()
+
+def db_get_phones(uid):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT data FROM phone_books WHERE user_id=%s", (uid,))
+            row = cur.fetchone()
+    return row[0] if row else {}
+
+def db_save_phones(uid, data):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO phone_books (user_id, data, updated_at)
+                VALUES (%s,%s,NOW())
+                ON CONFLICT (user_id) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
+            """, (uid, Json(data)))
+        conn.commit()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def norm_addr(addr: str) -> str:
     return re.sub(r'[^А-ЯІЇЄҐа-яіїєґA-Za-z0-9]', '',
         addr.upper()
@@ -28,7 +87,7 @@ def norm_addr(addr: str) -> str:
         .replace(';;','').replace('Б/Н','').replace('М.КАМІНЬ-КАШИРСЬКИЙ','')
         .replace('С.ЩИТИНЬ','').replace('С.СОШИЧНЕ',''))
 
-def find_phone(phone_book: dict, addr: str) -> str:
+def find_phone(phone_book, addr):
     if not phone_book: return ''
     key = norm_addr(addr)
     if not key: return ''
@@ -38,21 +97,21 @@ def find_phone(phone_book: dict, addr: str) -> str:
             return v
     return ''
 
-# ── Date helpers ──────────────────────────────────────────────────────────────
-def parse_date(s: str):
-    """Parse DD.MM -> date object with current year"""
+def parse_date(s):
     m = re.match(r'(\d{1,2})[.\-/](\d{1,2})', str(s))
     if not m: return None
-    try:
-        return datetime(datetime.now().year, int(m.group(2)), int(m.group(1)))
+    try: return datetime(datetime.now().year, int(m.group(2)), int(m.group(1)))
     except: return None
 
-def is_payable_by(pay_date: str, limit_date: datetime) -> bool:
+def is_payable_by(pay_date, limit_date):
     d = parse_date(pay_date)
     if not d: return False
     return d <= limit_date
 
-# ── XLSX parser ───────────────────────────────────────────────────────────────
+def fmt_hrn(n):
+    try: return f"{float(n):,.2f} ₴".replace(',', ' ')
+    except: return str(n)
+
 def parse_xlsx(data: bytes) -> dict:
     wb = openpyxl.load_workbook(io.BytesIO(data))
     ws = wb.active
@@ -66,7 +125,6 @@ def parse_xlsx(data: bytes) -> dict:
                 phone_map[key] = col3
     return phone_map
 
-# ── JSON extractor ────────────────────────────────────────────────────────────
 def extract_json(text):
     text = re.sub(r'^```(?:json)?\s*', '', text.strip())
     text = re.sub(r'\s*```$', '', text.strip()).strip()
@@ -78,9 +136,47 @@ def extract_json(text):
         except: pass
     return None
 
-def fmt_hrn(n):
-    try: return f"{float(n):,.2f} ₴".replace(',', ' ')
-    except: return str(n)
+def build_all_rows(vedomosti, phone_book):
+    grouped = {}
+    for v in vedomosti:
+        for r in v.get("rows", []):
+            key = r["name"] + "|" + norm_addr(r.get("address",""))
+            if key not in grouped:
+                grouped[key] = {
+                    "name": r["name"],
+                    "address": r.get("address",""),
+                    "passport": r.get("passport",""),
+                    "phone": find_phone(phone_book, r.get("address","")),
+                    "veds": []
+                }
+            grouped[key]["veds"].append({
+                "type": v.get("vedomist_type","?"),
+                "dil":  v.get("dilinitsa","?"),
+                "sum":  r.get("sum", 0),
+                "pay_date": r.get("pay_date","?")
+            })
+    return list(grouped.values())
+
+def format_rows(rows, phone_book):
+    chunks = []
+    current = ""
+    for i, r in enumerate(rows, 1):
+        addr  = r["address"].replace("Сошичне, ","").replace(";;","").strip()
+        phone = r.get("phone","") or find_phone(phone_book, r["address"])
+        veds_str = " ".join([f"В{v['type']}·{v['dil']}" for v in r["veds"]])
+        pays_str = " / ".join([f"{fmt_hrn(v.get('sum',0))} · {v['pay_date']}" for v in r["veds"]])
+
+        line = f"{i}. {r['name']}\n   📍 {addr}\n"
+        if phone: line += f"   📞 {phone}\n"
+        line += f"   📋 {veds_str}\n   💰 {pays_str}\n   🪪 {r['passport']}\n\n"
+
+        if len(current) + len(line) > 3800:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current: chunks.append(current)
+    return chunks
 
 # ── Claude API ────────────────────────────────────────────────────────────────
 async def ask_claude(b64: str) -> dict:
@@ -119,57 +215,7 @@ async def ask_claude(b64: str) -> dict:
             parsed["rows"] = []
         return parsed
 
-# ── Build grouped rows from all vedomosti ────────────────────────────────────
-def build_all_rows(vedomosti: list, phone_book: dict) -> list:
-    """Merge all vedomosti, group by name+address, collect all veds per person"""
-    grouped = {}
-    for v in vedomosti:
-        for r in v.get("rows", []):
-            key = r["name"] + "|" + norm_addr(r.get("address",""))
-            if key not in grouped:
-                grouped[key] = {
-                    "name": r["name"],
-                    "address": r.get("address",""),
-                    "passport": r.get("passport",""),
-                    "phone": find_phone(phone_book, r.get("address","")),
-                    "veds": []
-                }
-            grouped[key]["veds"].append({
-                "type": v.get("vedomist_type","?"),
-                "dil":  v.get("dilinitsa","?"),
-                "sum":  r.get("sum", 0),
-                "pay_date": r.get("pay_date","?")
-            })
-    return list(grouped.values())
-
-def format_rows(rows: list, phone_book: dict) -> list:
-    """Format rows into Telegram message chunks"""
-    chunks = []
-    current = ""
-    for i, r in enumerate(rows, 1):
-        addr = r["address"].replace("Сошичне, ","").replace(";;","").strip()
-        phone = r.get("phone","") or find_phone(phone_book, r["address"])
-        veds_str = " ".join([f"В{v['type']}·{v['dil']}" for v in r["veds"]])
-        pays_str = " / ".join([f"{fmt_hrn(v.get('sum',0))} · {v['pay_date']}" for v in r["veds"]])
-
-        line = f"{i}. {r['name']}\n   📍 {addr}\n"
-        if phone:
-            line += f"   📞 {phone}\n"
-        line += f"   📋 {veds_str}\n"
-        line += f"   💰 {pays_str}\n   🪪 {r['passport']}\n\n"
-
-        if len(current) + len(line) > 3800:
-            chunks.append(current)
-            current = line
-        else:
-            current += line
-
-    if current:
-        chunks.append(current)
-    return chunks
-
 # ── Handlers ──────────────────────────────────────────────────────────────────
-
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привіт! Бот для обробки відомостей ПФУ.\n\n"
@@ -179,100 +225,107 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/status — скільки відомостей і людей\n"
         "/list — зведений список всіх\n"
         "/today 07.06 — виплати до вказаної дати\n"
+        "/search Шворак — пошук за прізвищем\n"
         "/clear — очистити всі відомості\n"
         "/phones — статус телефонної книги"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ud = get_ud(uid)
-    veds = ud["vedomosti"]
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
     if not veds:
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
-    rows = build_all_rows(veds, ud["phone_book"])
+    rows = build_all_rows(veds, phones)
     total_sum = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in rows)
     ved_list = "\n".join([f"  • В{v.get('vedomist_type','?')}·Діл.{v.get('dilinitsa','?')} — {len(v.get('rows',[]))} ос. ({v.get('period','')})" for v in veds])
     await update.message.reply_text(
         f"📊 Статус:\n{ved_list}\n\n"
-        f"👥 Всього унікальних осіб: {len(rows)}\n"
+        f"👥 Унікальних осіб: {len(rows)}\n"
         f"💰 Загальна сума: {fmt_hrn(total_sum)}\n"
-        f"📞 Телефонна книга: {len(ud['phone_book'])} адрес"
+        f"📞 Телефонна книга: {len(phones)} адрес"
     )
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ud = get_ud(uid)
-    if not ud["vedomosti"]:
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
+    if not veds:
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
-    rows = build_all_rows(ud["vedomosti"], ud["phone_book"])
+    rows = build_all_rows(veds, phones)
     rows.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
-    header = f"📋 Зведений список · {len(rows)} осіб\n{'─'*28}\n"
-    chunks = format_rows(rows, ud["phone_book"])
-    await update.message.reply_text(header)
-    for chunk in chunks:
+    await update.message.reply_text(f"📋 Зведений список · {len(rows)} осіб\n{'─'*28}")
+    for chunk in format_rows(rows, phones):
         await update.message.reply_text(chunk)
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ud = get_ud(uid)
-    if not ud["vedomosti"]:
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
+    if not veds:
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
-
-    # Parse date from command args
-    args = ctx.args
-    if not args:
+    if not ctx.args:
         await update.message.reply_text("⚠️ Вкажи дату: /today 07.06")
         return
-    limit = parse_date(args[0])
+    limit = parse_date(ctx.args[0])
     if not limit:
-        await update.message.reply_text("⚠️ Невірний формат дати. Приклад: /today 07.06")
+        await update.message.reply_text("⚠️ Невірний формат. Приклад: /today 07.06")
         return
-
-    all_rows = build_all_rows(ud["vedomosti"], ud["phone_book"])
-    # Filter rows that have at least one ved payable by limit date
+    all_rows = build_all_rows(veds, phones)
     filtered = []
     for r in all_rows:
-        payable_veds = [v for v in r["veds"] if is_payable_by(v["pay_date"], limit)]
-        if payable_veds:
-            filtered.append({**r, "veds": payable_veds})
-
+        payable = [v for v in r["veds"] if is_payable_by(v["pay_date"], limit)]
+        if payable:
+            filtered.append({**r, "veds": payable})
     if not filtered:
-        await update.message.reply_text(f"📭 Немає виплат до {args[0]}")
+        await update.message.reply_text(f"📭 Немає виплат до {ctx.args[0]}")
         return
-
     filtered.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in filtered)
-    header = f"📅 Виплати до {args[0]} · {len(filtered)} осіб · {fmt_hrn(total)}\n{'─'*28}\n"
-    chunks = format_rows(filtered, ud["phone_book"])
-    await update.message.reply_text(header)
-    for chunk in chunks:
+    await update.message.reply_text(f"📅 Виплати до {ctx.args[0]} · {len(filtered)} осіб · {fmt_hrn(total)}\n{'─'*28}")
+    for chunk in format_rows(filtered, phones):
+        await update.message.reply_text(chunk)
+
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
+    if not veds:
+        await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("⚠️ Вкажи прізвище: /search Шворак")
+        return
+    query = " ".join(ctx.args).upper().strip()
+    found = [r for r in build_all_rows(veds, phones) if query in r["name"].upper()]
+    if not found:
+        await update.message.reply_text(f"🔍 Нічого не знайдено: {query}")
+        return
+    await update.message.reply_text(f"🔍 '{query}' · {len(found)} осіб\n{'─'*28}")
+    for chunk in format_rows(found, phones):
         await update.message.reply_text(chunk)
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ud = get_ud(uid)
-    count = len(ud["vedomosti"])
-    ud["vedomosti"] = []
-    await update.message.reply_text(f"🗑 Очищено {count} відомостей. Телефонна книга збережена.")
+    veds = db_get_vedomosti(uid)
+    db_clear_vedomosti(uid)
+    await update.message.reply_text(f"🗑 Очищено {len(veds)} відомостей. Телефонна книга збережена.")
 
 async def cmd_phones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ud = get_ud(uid)
-    n = len(ud["phone_book"])
-    if n:
-        await update.message.reply_text(f"📞 Телефонна книга: {n} адрес завантажено")
+    phones = db_get_phones(uid)
+    if phones:
+        await update.message.reply_text(f"📞 Телефонна книга: {len(phones)} адрес")
     else:
         await update.message.reply_text("📞 Телефонна книга не завантажена\nНадішли XLSX файл.")
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     uid = update.effective_user.id
-    ud = get_ud(uid)
 
-    # XLSX
     is_xlsx = (doc.mime_type in (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/vnd.ms-excel"
@@ -284,13 +337,12 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             file = await ctx.bot.get_file(doc.file_id)
             data = await file.download_as_bytearray()
             phone_map = parse_xlsx(bytes(data))
-            ud["phone_book"] = phone_map
-            await msg.edit_text(f"✅ Телефонна книга: {len(phone_map)} адрес завантажено")
+            db_save_phones(uid, phone_map)
+            await msg.edit_text(f"✅ Телефонна книга: {len(phone_map)} адрес збережено")
         except Exception as e:
             await msg.edit_text(f"❌ Помилка XLSX: {str(e)[:300]}")
         return
 
-    # PDF
     if doc.mime_type != "application/pdf":
         await update.message.reply_text("⚠️ Надішли PDF відомість або XLSX телефонну книгу")
         return
@@ -311,27 +363,19 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("⚠️ Рядків не знайдено")
             return
 
-        # Check if this vedomist already loaded (same type+dilinitsa+period)
-        key = f"{result.get('vedomist_type')}|{result.get('dilinitsa')}|{result.get('period')}"
-        existing = next((i for i, v in enumerate(ud["vedomosti"])
-                        if f"{v.get('vedomist_type')}|{v.get('dilinitsa')}|{v.get('period')}" == key), None)
+        db_save_vedomist(uid, result)
 
-        if existing is not None:
-            ud["vedomosti"][existing] = result
-            status = "♻️ Оновлено"
-        else:
-            ud["vedomosti"].append(result)
-            status = "✅ Додано"
+        veds = db_get_vedomosti(uid)
+        phones = db_get_phones(uid)
+        total_people = len(build_all_rows(veds, phones))
 
         ved = result.get("vedomist_type","?")
         dil = result.get("dilinitsa","?")
         per = result.get("period","?")
-        total_veds = len(ud["vedomosti"])
-        total_people = len(build_all_rows(ud["vedomosti"], ud["phone_book"]))
 
         await msg.edit_text(
-            f"{status}: В{ved}·Діл.{dil} · {per} · {len(rows)} осіб\n\n"
-            f"📊 Всього відомостей: {total_veds}\n"
+            f"✅ Збережено: В{ved}·Діл.{dil} · {per} · {len(rows)} осіб\n\n"
+            f"📊 Всього відомостей: {len(veds)}\n"
             f"👥 Унікальних осіб: {total_people}\n\n"
             f"Команди: /list · /today 07.06 · /status"
         )
@@ -339,61 +383,38 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Помилка: {str(e)[:500]}")
 
-async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ud = get_ud(uid)
-    if not ud["vedomosti"]:
-        await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("⚠️ Вкажи прізвище: /search Шворак")
-        return
-    query = " ".join(ctx.args).upper().strip()
-    all_rows = build_all_rows(ud["vedomosti"], ud["phone_book"])
-    found = [r for r in all_rows if query in r["name"].upper()]
-    if not found:
-        await update.message.reply_text(f"🔍 Нічого не знайдено за запитом: {query}")
-        return
-    header = f"🔍 Результат пошуку '{query}' · {len(found)} осіб\n{'─'*28}\n"
-    chunks = format_rows(found, ud["phone_book"])
-    await update.message.reply_text(header)
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
-
 async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Try to use text as search query
     uid = update.effective_user.id
-    ud = get_ud(uid)
     text = update.message.text.strip().upper()
-    if len(text) >= 3 and ud["vedomosti"]:
-        all_rows = build_all_rows(ud["vedomosti"], ud["phone_book"])
-        found = [r for r in all_rows if text in r["name"].upper()]
-        if found:
-            header = f"🔍 '{update.message.text.strip()}' · {len(found)} осіб\n{'─'*28}\n"
-            chunks = format_rows(found, ud["phone_book"])
-            await update.message.reply_text(header)
-            for chunk in chunks:
-                await update.message.reply_text(chunk)
-            return
+    if len(text) >= 3:
+        veds = db_get_vedomosti(uid)
+        phones = db_get_phones(uid)
+        if veds:
+            found = [r for r in build_all_rows(veds, phones) if text in r["name"].upper()]
+            if found:
+                await update.message.reply_text(f"🔍 '{update.message.text.strip()}' · {len(found)} осіб\n{'─'*28}")
+                for chunk in format_rows(found, phones):
+                    await update.message.reply_text(chunk)
+                return
     await update.message.reply_text(
-        "📄 Надішли PDF відомість або XLSX телефонну книгу\n\n"
-        "Команди:\n/list · /today 07.06 · /status · /clear\n"
-        "/search Шворак — пошук за прізвищем\n\n"
-        "Або просто напиши прізвище для пошуку"
+        "📄 Надішли PDF або XLSX\n\n"
+        "Команди: /list · /today 07.06 · /status · /clear\n"
+        "/search Шворак або просто напиши прізвище"
     )
 
 def main():
+    init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(CommandHandler("today",  cmd_today))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("clear",  cmd_clear))
     app.add_handler(CommandHandler("phones", cmd_phones))
-    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
-    print("Bot started")
+    print("Bot started with DB")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
