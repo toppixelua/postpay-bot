@@ -680,33 +680,6 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/search Шв або просто напиши прізвище"
     )
 
-def main():
-    init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",       start))
-    app.add_handler(CommandHandler("status",      cmd_status))
-    app.add_handler(CommandHandler("list",        cmd_list))
-    app.add_handler(CommandHandler("today",       cmd_today))
-    app.add_handler(CommandHandler("search",      cmd_search))
-    app.add_handler(CommandHandler("multi",       cmd_multi))
-    app.add_handler(CommandHandler("clear",       cmd_clear))
-    app.add_handler(CommandHandler("phones",      cmd_phones))
-    app.add_handler(CommandHandler("paid",        cmd_paid))
-    app.add_handler(CommandHandler("unpaid",      cmd_unpaid_cmd))
-    app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
-    app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
-    app.add_handler(CommandHandler("pb_find",   cmd_pb_find))
-    app.add_handler(CommandHandler("pb_add",    cmd_pb_add))
-    app.add_handler(CommandHandler("pb_edit",   cmd_pb_edit))
-    app.add_handler(CommandHandler("pb_del",    cmd_pb_del))
-    app.add_handler(CommandHandler("pb_export", cmd_pb_export))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
-    print("Bot started with DB")
-    app.run_polling(close_loop=False)
-
-if __name__ == "__main__":
-    main()
 
 # ════════════════════════════════════════════════════════════════
 # PHONE BOOK — повна реалізація
@@ -970,3 +943,31 @@ async def cmd_pb_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.delete()
     except Exception as e:
         await msg.edit_text("❌ Помилка: " + str(e)[:300])
+
+def main():
+    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",       start))
+    app.add_handler(CommandHandler("status",      cmd_status))
+    app.add_handler(CommandHandler("list",        cmd_list))
+    app.add_handler(CommandHandler("today",       cmd_today))
+    app.add_handler(CommandHandler("search",      cmd_search))
+    app.add_handler(CommandHandler("multi",       cmd_multi))
+    app.add_handler(CommandHandler("clear",       cmd_clear))
+    app.add_handler(CommandHandler("phones",      cmd_phones))
+    app.add_handler(CommandHandler("paid",        cmd_paid))
+    app.add_handler(CommandHandler("unpaid",      cmd_unpaid_cmd))
+    app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
+    app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
+    app.add_handler(CommandHandler("pb_find",   cmd_pb_find))
+    app.add_handler(CommandHandler("pb_add",    cmd_pb_add))
+    app.add_handler(CommandHandler("pb_edit",   cmd_pb_edit))
+    app.add_handler(CommandHandler("pb_del",    cmd_pb_del))
+    app.add_handler(CommandHandler("pb_export", cmd_pb_export))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
+    print("Bot started with DB")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()
