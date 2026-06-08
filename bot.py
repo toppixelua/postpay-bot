@@ -737,29 +737,23 @@ def pb_import_xlsx(uid, data: bytes):
         conn.commit()
     return len(entries)
 
-def norm_search(q):
-    """Normalize search query for flexible matching"""
-    # Remove spaces around commas, normalize spaces
-    q = q.strip().lower()
-    q = q.replace(', ', ',').replace(' ,', ',')
-    return q
+def strip_addr(s):
+    """Strip address to bare letters+digits for fuzzy match"""
+    import re as _re
+    return _re.sub(r'[^а-яіїєґa-z0-9]', '', str(s).lower())
 
 def pb_find_by_street(uid, street_query):
-    """Find entries by partial street match - flexible"""
-    q = norm_search(street_query)
-    # Also try without spaces between street name and number
-    q_nospace = q.replace(' ', '')
+    """Find entries by partial street match - very flexible"""
+    q_stripped = strip_addr(street_query)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, street, name, phone, notes FROM pb_entries
-                WHERE user_id=%s AND (
-                    LOWER(REPLACE(REPLACE(street, ' ', ''), ',', '')) LIKE %s
-                    OR LOWER(street) LIKE %s
-                )
-                ORDER BY street, id
-            """, (uid, '%' + q_nospace + '%', '%' + q + '%'))
-            return cur.fetchall()
+            # Pull all entries and filter in Python for max flexibility
+            cur.execute(
+                "SELECT id, street, name, phone, notes FROM pb_entries WHERE user_id=%s ORDER BY street, id",
+                (uid,)
+            )
+            all_rows = cur.fetchall()
+    return [r for r in all_rows if q_stripped in strip_addr(r[1])]
 
 def pb_find_by_name(uid, name_query):
     """Find entries by partial name match"""
