@@ -291,7 +291,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/paid Шворак — відмітити як виплачено\n"
         "/unpaid Шворак — зняти позначку\n"
         "/unpaid_list — список невиплачених\n"
-        "/clear_paid — зняти всі позначки"
+        "/clear_paid — зняти всі позначки\n"
+        "/multi — отримувачі з 2+ виплатами"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -557,6 +558,30 @@ async def cmd_clear_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_clear_paid(uid)
     await update.message.reply_text("↩️ Всі позначки виплат знято")
 
+async def cmd_multi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    veds = db_get_vedomosti(uid)
+    phones = db_get_phones(uid)
+    if not veds:
+        await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
+        return
+    all_rows = build_all_rows(veds, phones)
+    multi = [r for r in all_rows if len(r["veds"]) >= 2]
+    if not multi:
+        await update.message.reply_text("📭 Немає отримувачів з двома і більше виплатами.")
+        return
+    multi.sort(key=lambda r: r["name"])
+    paid = db_get_paid(uid)
+    total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in multi)
+    await update.message.reply_text(
+        f"👥 Отримувачів з 2+ виплатами: {len(multi)}
+"
+        f"💰 Загальна сума: {fmt_hrn(total)}
+{'─'*28}"
+    )
+    for chunk in format_rows(multi, phones, paid):
+        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN_V2)
+
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -570,6 +595,7 @@ def main():
     app.add_handler(CommandHandler("unpaid",      cmd_unpaid))
     app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
     app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
+    app.add_handler(CommandHandler("multi",       cmd_multi))
     app.add_handler(CommandHandler("phones", cmd_phones))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
