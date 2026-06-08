@@ -614,7 +614,12 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data = await file.download_as_bytearray()
             phone_map = parse_xlsx(bytes(data))
             db_save_phones(uid, phone_map)
-            await msg.edit_text("✅ Телефонна книга: " + str(len(phone_map)) + " адрес збережено")
+            # Also import into structured pb_entries table
+            try:
+                n = pb_import_xlsx(uid, bytes(data))
+                await msg.edit_text("✅ Телефонна книга: " + str(len(phone_map)) + " адрес · " + str(n) + " записів збережено")
+            except Exception as pb_err:
+                await msg.edit_text("✅ Телефонна книга: " + str(len(phone_map)) + " адрес збережено")
         except Exception as e:
             await msg.edit_text("❌ Помилка XLSX: " + str(e)[:300])
         return
@@ -690,6 +695,11 @@ def main():
     app.add_handler(CommandHandler("unpaid",      cmd_unpaid_cmd))
     app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
     app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
+    app.add_handler(CommandHandler("pb_find",   cmd_pb_find))
+    app.add_handler(CommandHandler("pb_add",    cmd_pb_add))
+    app.add_handler(CommandHandler("pb_edit",   cmd_pb_edit))
+    app.add_handler(CommandHandler("pb_del",    cmd_pb_del))
+    app.add_handler(CommandHandler("pb_export", cmd_pb_export))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
     print("Bot started with DB")
@@ -697,3 +707,266 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ════════════════════════════════════════════════════════════════
+# PHONE BOOK — повна реалізація
+# ════════════════════════════════════════════════════════════════
+
+# ── Phone book DB ─────────────────────────────────────────────────────────────
+def pb_init(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pb_entries (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                street TEXT NOT NULL,
+                name TEXT,
+                phone TEXT,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS pb_street_idx ON pb_entries(user_id, street);
+        """)
+    conn.commit()
+
+def pb_import_xlsx(uid, data: bytes):
+    """Import xlsx into pb_entries table"""
+    import io as _io
+    import openpyxl as _xl
+    wb = _xl.load_workbook(_io.BytesIO(data))
+    ws = wb.active
+    entries = []
+    current_street = None
+    for row in ws.iter_rows(values_only=True):
+        col1 = str(row[0] or '').strip()
+        col2 = str(row[1] or '').strip()
+        col3 = str(row[2] or '').strip()
+        col4 = str(row[3] or '').strip()
+        col5 = str(row[4] or '').strip()
+        # Street header row
+        if col1 and not col2 and not col3:
+            continue
+        # Address row
+        if col2.lower().startswith('вул.'):
+            current_street = col2
+        if current_street and (col3 or col4):
+            entries.append((uid, current_street, col3 or None, col4 or None, col5 or None))
+    with get_conn() as conn:
+        pb_init(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pb_entries WHERE user_id=%s", (uid,))
+            if entries:
+                cur.executemany(
+                    "INSERT INTO pb_entries (user_id, street, name, phone, notes) VALUES (%s,%s,%s,%s,%s)",
+                    entries
+                )
+        conn.commit()
+    return len(entries)
+
+def pb_find_by_street(uid, street_query):
+    """Find entries by partial street match"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, street, name, phone, notes FROM pb_entries WHERE user_id=%s AND LOWER(street) LIKE %s ORDER BY street, id",
+                (uid, '%' + street_query.lower() + '%')
+            )
+            return cur.fetchall()
+
+def pb_find_by_name(uid, name_query):
+    """Find entries by partial name match"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, street, name, phone, notes FROM pb_entries WHERE user_id=%s AND LOWER(name) LIKE %s ORDER BY street, id",
+                (uid, '%' + name_query.lower() + '%')
+            )
+            return cur.fetchall()
+
+def pb_add_entry(uid, street, name, phone, notes=None):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO pb_entries (user_id, street, name, phone, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                (uid, street, name, phone, notes)
+            )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return new_id
+
+def pb_update_entry(uid, entry_id, name=None, phone=None, notes=None):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if name is not None:
+                cur.execute("UPDATE pb_entries SET name=%s, updated_at=NOW() WHERE id=%s AND user_id=%s", (name, entry_id, uid))
+            if phone is not None:
+                cur.execute("UPDATE pb_entries SET phone=%s, updated_at=NOW() WHERE id=%s AND user_id=%s", (phone, entry_id, uid))
+            if notes is not None:
+                cur.execute("UPDATE pb_entries SET notes=%s, updated_at=NOW() WHERE id=%s AND user_id=%s", (notes, entry_id, uid))
+        conn.commit()
+
+def pb_delete_entry(uid, entry_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pb_entries WHERE id=%s AND user_id=%s", (entry_id, uid))
+        conn.commit()
+
+def pb_export_xlsx(uid) -> bytes:
+    """Export pb_entries to xlsx bytes"""
+    import io as _io
+    import openpyxl as _xl
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT street, name, phone, notes FROM pb_entries WHERE user_id=%s ORDER BY street, id",
+                (uid,)
+            )
+            rows = cur.fetchall()
+    wb = _xl.Workbook()
+    ws = wb.active
+    ws.title = "Телефонна книга"
+    ws.append(['п/п', 'Вулиця/№будинку', 'ПІБ', '№ телефону', 'Примітки'])
+    current_street = None
+    n = 1
+    for street, name, phone, notes in rows:
+        if street != current_street:
+            current_street = street
+            ws.append([None, street, name, phone, notes])
+        else:
+            ws.append([None, None, name, phone, notes])
+        n += 1
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+def fmt_pb_entries(entries):
+    """Format list of pb entries for display"""
+    if not entries:
+        return "Нічого не знайдено"
+    lines = []
+    current_street = None
+    for eid, street, name, phone, notes in entries:
+        if street != current_street:
+            current_street = street
+            lines.append("\n📍 " + street)
+        line = "  [" + str(eid) + "] " + (name or '—')
+        if phone: line += " · 📞 " + phone
+        if notes: line += " · 📝 " + notes
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+# ── Phone book handlers ────────────────────────────────────────────────────────
+
+async def cmd_pb_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Search phone book: /pb_find Шкільна 7  or  /pb_find Левчук"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            "🔍 Пошук у телефонній книзі:\n"
+            "/pb_find Шкільна 7 — по адресі\n"
+            "/pb_find Левчук — по ПІБ"
+        )
+        return
+    query = " ".join(ctx.args).strip()
+    # Try address search first (contains 'вул' or digit)
+    if any(c.isdigit() for c in query) or 'вул' in query.lower():
+        entries = pb_find_by_street(uid, query)
+    else:
+        entries = pb_find_by_name(uid, query)
+        if not entries:
+            entries = pb_find_by_street(uid, query)
+    if not entries:
+        await update.message.reply_text("🔍 Нічого не знайдено: " + query)
+        return
+    text = "🔍 Знайдено " + str(len(entries)) + " записів:\n" + fmt_pb_entries(entries)
+    text += "\n\nРедагувати: /pb_edit [ID] [поле] [значення]\nВидалити: /pb_del [ID]"
+    await update.message.reply_text(text[:4000])
+
+async def cmd_pb_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/pb_add вул. Шкільна, 7 | Іван Петрович | 0991234567"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            "➕ Додати запис:\n"
+            "/pb_add вул. Шкільна, 7 | Іван Петрович | 0991234567\n"
+            "/pb_add вул. Шкільна, 7 | Марія | 0661234567 | примітка"
+        )
+        return
+    text = " ".join(ctx.args)
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) < 3:
+        await update.message.reply_text("⚠️ Формат: /pb_add вул. Адреса | ПІБ | телефон")
+        return
+    street = parts[0]
+    name   = parts[1]
+    phone  = parts[2]
+    notes  = parts[3] if len(parts) > 3 else None
+    new_id = pb_add_entry(uid, street, name, phone, notes)
+    await update.message.reply_text(
+        "✅ Додано [" + str(new_id) + "]:\n"
+        "📍 " + street + "\n"
+        "👤 " + name + "\n"
+        "📞 " + phone +
+        ("\n📝 " + notes if notes else "")
+    )
+
+async def cmd_pb_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/pb_edit 42 phone 0991234567  or  /pb_edit 42 name Нова Людина"""
+    uid = update.effective_user.id
+    if not ctx.args or len(ctx.args) < 3:
+        await update.message.reply_text(
+            "✏️ Редагувати запис:\n"
+            "/pb_edit [ID] phone 0991234567\n"
+            "/pb_edit [ID] name Нове ПІБ\n"
+            "/pb_edit [ID] notes примітка\n\n"
+            "ID видно після /pb_find"
+        )
+        return
+    try:
+        entry_id = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID має бути числом")
+        return
+    field = ctx.args[1].lower()
+    value = " ".join(ctx.args[2:])
+    if field in ('phone', 'телефон'):
+        pb_update_entry(uid, entry_id, phone=value)
+        await update.message.reply_text("✅ Телефон оновлено: [" + str(entry_id) + "] → " + value)
+    elif field in ('name', 'піб', 'пib'):
+        pb_update_entry(uid, entry_id, name=value)
+        await update.message.reply_text("✅ ПІБ оновлено: [" + str(entry_id) + "] → " + value)
+    elif field in ('notes', 'примітка'):
+        pb_update_entry(uid, entry_id, notes=value)
+        await update.message.reply_text("✅ Примітку оновлено: [" + str(entry_id) + "] → " + value)
+    else:
+        await update.message.reply_text("⚠️ Поле: phone, name або notes")
+
+async def cmd_pb_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/pb_del 42"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("🗑 Видалити запис: /pb_del [ID]")
+        return
+    try:
+        entry_id = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID має бути числом")
+        return
+    pb_delete_entry(uid, entry_id)
+    await update.message.reply_text("🗑 Запис [" + str(entry_id) + "] видалено")
+
+async def cmd_pb_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/pb_export — вивантажити xlsx"""
+    uid = update.effective_user.id
+    msg = await update.message.reply_text("⏳ Формую файл...")
+    try:
+        data = pb_export_xlsx(uid)
+        await update.message.reply_document(
+            document=data,
+            filename="телефонна_книга.xlsx",
+            caption="📞 Актуальна телефонна книга"
+        )
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text("❌ Помилка: " + str(e)[:300])
