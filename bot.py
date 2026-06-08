@@ -653,7 +653,11 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = update.message.text.strip().upper()
+    text = update.message.text.strip()
+    # Ignore bare "/" — user opened command menu
+    if text == "/":
+        return
+    text = text.upper()
     if len(text) >= 2:
         veds = db_get_vedomosti(uid)
         phones = db_get_phones(uid)
