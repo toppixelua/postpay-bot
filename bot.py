@@ -255,8 +255,17 @@ def format_rows(rows, phone_book, paid_set=None):
             line += " · " + fmt_hrn(ved.get("sum",0))
             line += " · 📅 " + ved["pay_date"] + "\n"
 
+        # Totals
+        total_sum = sum(float(v.get("sum",0)) for v in r["veds"])
+        paid_sum  = sum(float(v.get("sum",0)) for v in r["veds"] if is_ved_paid(r, v, paid_set))
+        unpaid_sum = total_sum - paid_sum
+
         if all_paid:
-            line += "   ✔️ Виплачено\n"
+            line += "   ✔️ Виплачено: " + fmt_hrn(total_sum) + "\n"
+        else:
+            line += "   💳 До виплати: " + fmt_hrn(unpaid_sum) + "\n"
+            if paid_sum > 0:
+                line += "   ✅ Виплачено: " + fmt_hrn(paid_sum) + "\n"
 
         line += "   🪪 " + r["passport"] + "\n\n"
 
