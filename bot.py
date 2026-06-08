@@ -43,7 +43,6 @@ def init_db():
                     PRIMARY KEY (user_id, person_key, pay_date)
                 );
             """)
-            # Migrate old paid_marks if needed (no pay_date column)
             try:
                 cur.execute("ALTER TABLE paid_marks ADD COLUMN IF NOT EXISTS pay_date TEXT NOT NULL DEFAULT ''")
             except Exception:
@@ -91,9 +90,7 @@ def db_save_phones(uid, data):
             """, (uid, Json(data)))
         conn.commit()
 
-# paid_marks: person_key + pay_date as composite key
 def db_get_paid(uid):
-    """Returns set of (person_key, pay_date) tuples"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT person_key, pay_date FROM paid_marks WHERE user_id=%s", (uid,))
@@ -184,7 +181,34 @@ def extract_json(text):
         except: pass
     return None
 
-def build_all_rows(vedomosti, phone_book):
+# ── ОНОВЛЕНО: find_phone тепер шукає в pb_entries (нова таблиця) + fallback на старий dict ──
+def find_phone(phone_book, addr, uid=None):
+    """Шукає телефон спочатку в pb_entries (по uid), потім у старому phone_book dict"""
+    # 1) Пошук у новій таблиці pb_entries
+    if uid is not None:
+        try:
+            entries = pb_find_by_street(uid, addr)
+            # Повертаємо перший телефон що знайдено
+            for eid, street, name, phone, notes in entries:
+                if phone and phone.strip():
+                    return phone.strip()
+        except Exception:
+            pass
+
+    # 2) Fallback на старий phone_book dict
+    if not phone_book:
+        return ''
+    key = norm_addr(addr)
+    if not key:
+        return ''
+    if key in phone_book:
+        return phone_book[key]
+    for k, v in phone_book.items():
+        if len(key) > 5 and (k.startswith(key) or key.startswith(k)):
+            return v
+    return ''
+
+def build_all_rows(vedomosti, phone_book, uid=None):
     grouped = {}
     for v in vedomosti:
         for r in v.get("rows", []):
@@ -195,7 +219,7 @@ def build_all_rows(vedomosti, phone_book):
                     "address": r.get("address",""),
                     "passport": r.get("passport",""),
                     "account": r.get("account",""),
-                    "phone": find_phone(phone_book, r.get("address","")),
+                    "phone": find_phone(phone_book, r.get("address",""), uid=uid),
                     "veds": []
                 }
             grouped[key]["veds"].append({
@@ -206,16 +230,6 @@ def build_all_rows(vedomosti, phone_book):
             })
     return list(grouped.values())
 
-def find_phone(phone_book, addr):
-    if not phone_book: return ''
-    key = norm_addr(addr)
-    if not key: return ''
-    if key in phone_book: return phone_book[key]
-    for k, v in phone_book.items():
-        if len(key) > 5 and (k.startswith(key) or key.startswith(k)):
-            return v
-    return ''
-
 def is_person_fully_paid(r, paid_set):
     key = make_person_key(r)
     return all((key, v["pay_date"]) in paid_set for v in r["veds"])
@@ -224,7 +238,7 @@ def is_ved_paid(r, ved, paid_set):
     key = make_person_key(r)
     return (key, ved["pay_date"]) in paid_set
 
-def format_rows(rows, phone_book, paid_set=None):
+def format_rows(rows, phone_book, paid_set=None, uid=None):
     if paid_set is None:
         paid_set = set()
     chunks = []
@@ -232,11 +246,10 @@ def format_rows(rows, phone_book, paid_set=None):
     for i, r in enumerate(rows, 1):
         key       = make_person_key(r)
         addr      = r["address"].replace("Сошичне, ","").replace(";;","").strip()
-        phone     = r.get("phone","") or find_phone(phone_book, r["address"])
+        phone     = r.get("phone","") or find_phone(phone_book, r["address"], uid=uid)
         account   = r.get("account","")
         all_paid  = is_person_fully_paid(r, paid_set)
 
-        # Header
         if all_paid:
             line = str(i) + ". ✅ " + r["name"] + "\n"
         else:
@@ -247,7 +260,6 @@ def format_rows(rows, phone_book, paid_set=None):
         if account:
             line += "   🔢 " + account + "\n"
 
-        # Each payment
         for ved in r["veds"]:
             ved_paid = is_ved_paid(r, ved, paid_set)
             status = "✅" if ved_paid else "⏳"
@@ -255,9 +267,8 @@ def format_rows(rows, phone_book, paid_set=None):
             line += " · " + fmt_hrn(ved.get("sum",0))
             line += " · 📅 " + ved["pay_date"] + "\n"
 
-        # Totals
-        total_sum = sum(float(v.get("sum",0)) for v in r["veds"])
-        paid_sum  = sum(float(v.get("sum",0)) for v in r["veds"] if is_ved_paid(r, v, paid_set))
+        total_sum  = sum(float(v.get("sum",0)) for v in r["veds"])
+        paid_sum   = sum(float(v.get("sum",0)) for v in r["veds"] if is_ved_paid(r, v, paid_set))
         unpaid_sum = total_sum - paid_sum
 
         if all_paid:
@@ -350,7 +361,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/unpaid 001256811781 — зняти всі позначки\n"
         "/unpaid 001256811781 05.06 — зняти по даті\n"
         "/unpaid_list — невиплачені\n"
-        "/clear_paid — зняти всі позначки"
+        "/clear_paid — зняти всі позначки\n\n"
+        "Телефонна книга:\n"
+        "/pb_find Шкільна 7 — пошук по адресі\n"
+        "/pb_find Левчук — пошук по ПІБ\n"
+        "/pb_phone Зарічна 36 0991234567 — швидко додати телефон\n"
+        "/pb_add вул. Адреса | ПІБ | телефон — повний запис\n"
+        "/pb_edit [ID] phone 0991234567 — редагувати\n"
+        "/pb_del [ID] — видалити\n"
+        "/pb_export — скачати xlsx"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -360,7 +379,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not veds:
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
-    rows = build_all_rows(veds, phones)
+    rows = build_all_rows(veds, phones, uid=uid)
     paid_set = db_get_paid(uid)
     total_veds_count = sum(len(r["veds"]) for r in rows)
     paid_count = sum(1 for r in rows for v in r["veds"] if is_ved_paid(r, v, paid_set))
@@ -381,12 +400,12 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not veds:
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
-    rows = build_all_rows(veds, phones)
+    rows = build_all_rows(veds, phones, uid=uid)
     rows.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
     paid_set = db_get_paid(uid)
     unpaid = sum(1 for r in rows if not is_person_fully_paid(r, paid_set))
     await update.message.reply_text("📋 Зведений список · " + str(len(rows)) + " осіб · не виплачено повністю: " + str(unpaid) + "\n" + "─"*28)
-    for chunk in format_rows(rows, phones, paid_set):
+    for chunk in format_rows(rows, phones, paid_set, uid=uid):
         await update.message.reply_text(chunk)
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -403,7 +422,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not limit:
         await update.message.reply_text("⚠️ Невірний формат. Приклад: /today 07.06")
         return
-    all_rows = build_all_rows(veds, phones)
+    all_rows = build_all_rows(veds, phones, uid=uid)
     filtered = []
     for r in all_rows:
         payable = [v for v in r["veds"] if is_payable_by(v["pay_date"], limit)]
@@ -417,7 +436,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in filtered)
     unpaid = sum(1 for r in filtered if not is_person_fully_paid(r, paid_set))
     await update.message.reply_text("📅 Виплати до " + ctx.args[0] + " · " + str(len(filtered)) + " осіб · не виплачено: " + str(unpaid) + "\n💰 " + fmt_hrn(total) + "\n" + "─"*28)
-    for chunk in format_rows(filtered, phones, paid_set):
+    for chunk in format_rows(filtered, phones, paid_set, uid=uid):
         await update.message.reply_text(chunk)
 
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -434,13 +453,13 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(query) < 2:
         await update.message.reply_text("⚠️ Мінімум 2 літери")
         return
-    found = [r for r in build_all_rows(veds, phones) if query in r["name"].upper()]
+    found = [r for r in build_all_rows(veds, phones, uid=uid) if query in r["name"].upper()]
     if not found:
         await update.message.reply_text("🔍 Нічого не знайдено: " + query)
         return
     paid_set = db_get_paid(uid)
     await update.message.reply_text("🔍 '" + query + "' · " + str(len(found)) + " осіб\n" + "─"*28)
-    for chunk in format_rows(found, phones, paid_set):
+    for chunk in format_rows(found, phones, paid_set, uid=uid):
         await update.message.reply_text(chunk)
 
 async def cmd_multi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -450,7 +469,7 @@ async def cmd_multi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not veds:
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
-    all_rows = build_all_rows(veds, phones)
+    all_rows = build_all_rows(veds, phones, uid=uid)
     multi = [r for r in all_rows if len(r["veds"]) >= 2]
     if not multi:
         await update.message.reply_text("📭 Немає отримувачів з двома і більше виплатами.")
@@ -459,7 +478,7 @@ async def cmd_multi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     paid_set = db_get_paid(uid)
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in multi)
     await update.message.reply_text("👥 Отримувачів з 2+ виплатами: " + str(len(multi)) + "\n💰 Загальна сума: " + fmt_hrn(total) + "\n" + "─"*28)
-    for chunk in format_rows(multi, phones, paid_set):
+    for chunk in format_rows(multi, phones, paid_set, uid=uid):
         await update.message.reply_text(chunk)
 
 async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -476,12 +495,9 @@ async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/paid 001256811781 05.06 — конкретна дата"
         )
         return
-
-    # Parse args: first arg = account/name, optional second = date
     query = ctx.args[0].strip()
     specific_date = norm_date(ctx.args[1]) if len(ctx.args) >= 2 else None
-
-    all_rows = build_all_rows(veds, phones)
+    all_rows = build_all_rows(veds, phones, uid=uid)
     found = find_by_account_or_name(all_rows, query)
     if not found:
         await update.message.reply_text("🔍 Не знайдено: " + query)
@@ -490,14 +506,11 @@ async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         names = "\n".join([str(i+1) + ". " + r.get("account","") + " " + r["name"] for i, r in enumerate(found)])
         await update.message.reply_text("Знайдено кілька — вкажи номер рахунку:\n" + names)
         return
-
     r = found[0]
     key = make_person_key(r)
     today = today_str()
     marked = []
-
     if specific_date:
-        # Mark specific date
         matching = [v for v in r["veds"] if norm_date(v["pay_date"]) == specific_date]
         if not matching:
             await update.message.reply_text("⚠️ Виплати на " + specific_date + " не знайдено для " + r["name"])
@@ -505,13 +518,11 @@ async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         db_mark_paid(uid, key, specific_date)
         marked = [specific_date]
     else:
-        # Mark all payable today or earlier
         limit = parse_date(today)
         for v in r["veds"]:
             if is_payable_by(v["pay_date"], limit):
                 db_mark_paid(uid, key, norm_date(v["pay_date"]))
                 marked.append(norm_date(v["pay_date"]))
-
     if not marked:
         await update.message.reply_text(
             "ℹ️ " + r["name"] + "\n"
@@ -520,7 +531,6 @@ async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/paid " + r.get("account","") + " " + r["veds"][0]["pay_date"] if r["veds"] else ""
         )
         return
-
     dates_str = ", ".join(marked)
     await update.message.reply_text("✅ Виплачено: " + r["name"] + "\n   🔢 " + r.get("account","") + "\n   📅 " + dates_str)
 
@@ -534,11 +544,9 @@ async def cmd_unpaid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("⚠️ Вкажи номер рахунку:\n/unpaid 001256811781\n/unpaid 001256811781 05.06")
         return
-
     query = ctx.args[0].strip()
     specific_date = norm_date(ctx.args[1]) if len(ctx.args) >= 2 else None
-
-    all_rows = build_all_rows(veds, phones)
+    all_rows = build_all_rows(veds, phones, uid=uid)
     found = find_by_account_or_name(all_rows, query)
     if not found:
         await update.message.reply_text("🔍 Не знайдено: " + query)
@@ -547,7 +555,6 @@ async def cmd_unpaid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         names = "\n".join([str(i+1) + ". " + r.get("account","") + " " + r["name"] for i, r in enumerate(found)])
         await update.message.reply_text("Знайдено кілька — вкажи номер рахунку:\n" + names)
         return
-
     r = found[0]
     key = make_person_key(r)
     db_unmark_paid(uid, key, specific_date)
@@ -563,9 +570,8 @@ async def cmd_unpaid_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not veds:
         await update.message.reply_text("📭 Відомостей немає.")
         return
-    all_rows = build_all_rows(veds, phones)
+    all_rows = build_all_rows(veds, phones, uid=uid)
     paid_set = db_get_paid(uid)
-    # Show people with at least one unpaid ved
     unpaid = []
     for r in all_rows:
         unpaid_veds = [v for v in r["veds"] if not is_ved_paid(r, v, paid_set)]
@@ -577,7 +583,7 @@ async def cmd_unpaid_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in unpaid)
     await update.message.reply_text("⏳ Не виплачено · " + str(len(unpaid)) + " осіб · " + fmt_hrn(total) + "\n" + "─"*28)
-    for chunk in format_rows(unpaid, phones, paid_set):
+    for chunk in format_rows(unpaid, phones, paid_set, uid=uid):
         await update.message.reply_text(chunk)
 
 async def cmd_clear_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -614,7 +620,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data = await file.download_as_bytearray()
             phone_map = parse_xlsx(bytes(data))
             db_save_phones(uid, phone_map)
-            # Also import into structured pb_entries table
             try:
                 n = pb_import_xlsx(uid, bytes(data))
                 await msg.edit_text("✅ Телефонна книга: " + str(len(phone_map)) + " адрес · " + str(n) + " записів збережено")
@@ -643,7 +648,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         db_save_vedomist(uid, result)
         veds = db_get_vedomosti(uid)
         phones = db_get_phones(uid)
-        total_people = len(build_all_rows(veds, phones))
+        total_people = len(build_all_rows(veds, phones, uid=uid))
         ved = result.get("vedomist_type","?")
         dil = result.get("dilinitsa","?")
         per = result.get("period","?")
@@ -659,7 +664,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
-    # Ignore bare "/" — user opened command menu
     if text == "/":
         return
     text = text.upper()
@@ -667,11 +671,11 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         veds = db_get_vedomosti(uid)
         phones = db_get_phones(uid)
         if veds:
-            found = [r for r in build_all_rows(veds, phones) if text in r["name"].upper()]
+            found = [r for r in build_all_rows(veds, phones, uid=uid) if text in r["name"].upper()]
             if found:
                 paid_set = db_get_paid(uid)
                 await update.message.reply_text("🔍 '" + update.message.text.strip() + "' · " + str(len(found)) + " осіб\n" + "─"*28)
-                for chunk in format_rows(found, phones, paid_set):
+                for chunk in format_rows(found, phones, paid_set, uid=uid):
                     await update.message.reply_text(chunk)
                 return
     await update.message.reply_text(
@@ -682,10 +686,9 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ════════════════════════════════════════════════════════════════
-# PHONE BOOK — повна реалізація
+# PHONE BOOK
 # ════════════════════════════════════════════════════════════════
 
-# ── Phone book DB ─────────────────────────────────────────────────────────────
 def pb_init(conn):
     with conn.cursor() as cur:
         cur.execute("""
@@ -704,7 +707,6 @@ def pb_init(conn):
     conn.commit()
 
 def pb_import_xlsx(uid, data: bytes):
-    """Import xlsx into pb_entries table"""
     import io as _io
     import openpyxl as _xl
     wb = _xl.load_workbook(_io.BytesIO(data))
@@ -717,10 +719,8 @@ def pb_import_xlsx(uid, data: bytes):
         col3 = str(row[2] or '').strip()
         col4 = str(row[3] or '').strip()
         col5 = str(row[4] or '').strip()
-        # Street header row
         if col1 and not col2 and not col3:
             continue
-        # Address row
         if col2.lower().startswith('вул.'):
             current_street = col2
         if current_street and (col3 or col4):
@@ -738,16 +738,12 @@ def pb_import_xlsx(uid, data: bytes):
     return len(entries)
 
 def strip_addr(s):
-    """Strip address to bare letters+digits for fuzzy match"""
-    import re as _re
-    return _re.sub(r'[^а-яіїєґa-z0-9]', '', str(s).lower())
+    return re.sub(r'[^а-яіїєґa-z0-9]', '', str(s).lower())
 
 def pb_find_by_street(uid, street_query):
-    """Find entries by partial street match - very flexible"""
     q_stripped = strip_addr(street_query)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Pull all entries and filter in Python for max flexibility
             cur.execute(
                 "SELECT id, street, name, phone, notes FROM pb_entries WHERE user_id=%s ORDER BY street, id",
                 (uid,)
@@ -756,7 +752,6 @@ def pb_find_by_street(uid, street_query):
     return [r for r in all_rows if q_stripped in strip_addr(r[1])]
 
 def pb_find_by_name(uid, name_query):
-    """Find entries by partial name match"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -794,7 +789,6 @@ def pb_delete_entry(uid, entry_id):
         conn.commit()
 
 def pb_export_xlsx(uid) -> bytes:
-    """Export pb_entries to xlsx bytes"""
     import io as _io
     import openpyxl as _xl
     with get_conn() as conn:
@@ -809,20 +803,17 @@ def pb_export_xlsx(uid) -> bytes:
     ws.title = "Телефонна книга"
     ws.append(['п/п', 'Вулиця/№будинку', 'ПІБ', '№ телефону', 'Примітки'])
     current_street = None
-    n = 1
     for street, name, phone, notes in rows:
         if street != current_street:
             current_street = street
             ws.append([None, street, name, phone, notes])
         else:
             ws.append([None, None, name, phone, notes])
-        n += 1
     buf = _io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 def fmt_pb_entries(entries):
-    """Format list of pb entries for display"""
     if not entries:
         return "Нічого не знайдено"
     lines = []
@@ -840,7 +831,6 @@ def fmt_pb_entries(entries):
 # ── Phone book handlers ────────────────────────────────────────────────────────
 
 async def cmd_pb_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Search phone book: /pb_find Шкільна 7  or  /pb_find Левчук"""
     uid = update.effective_user.id
     if not ctx.args:
         await update.message.reply_text(
@@ -850,7 +840,6 @@ async def cmd_pb_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     query = " ".join(ctx.args).strip()
-    # Try address search first (contains 'вул' or digit)
     if any(c.isdigit() for c in query) or 'вул' in query.lower():
         entries = pb_find_by_street(uid, query)
     else:
@@ -858,14 +847,13 @@ async def cmd_pb_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not entries:
             entries = pb_find_by_street(uid, query)
     if not entries:
-        await update.message.reply_text("🔍 Нічого не знайдено: " + query)
+        await update.message.reply_text("🔍 Нічого не знайдено: " + query + "\n\nДодати: /pb_phone " + query + " 0991234567")
         return
     text = "🔍 Знайдено " + str(len(entries)) + " записів:\n" + fmt_pb_entries(entries)
     text += "\n\nРедагувати: /pb_edit [ID] [поле] [значення]\nВидалити: /pb_del [ID]"
     await update.message.reply_text(text[:4000])
 
 async def cmd_pb_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/pb_add вул. Шкільна, 7 | Іван Петрович | 0991234567"""
     uid = update.effective_user.id
     if not ctx.args:
         await update.message.reply_text(
@@ -892,8 +880,76 @@ async def cmd_pb_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ("\n📝 " + notes if notes else "")
     )
 
+async def cmd_pb_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/pb_phone Зарічна 36 0991234567 — швидко додати телефон по адресі"""
+    uid = update.effective_user.id
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text(
+            "📞 Швидке додавання телефону:\n"
+            "/pb_phone Зарічна 36 0991234567\n"
+            "/pb_phone Ковельська 174 0671234567\n\n"
+            "Останній аргумент — телефон, решта — адреса"
+        )
+        return
+
+    phone = ctx.args[-1]
+    addr_parts = ctx.args[:-1]
+
+    # Перевірити що останній аргумент схожий на телефон
+    if not re.match(r'^[\d\+\(\)\-]{7,}$', phone):
+        await update.message.reply_text(
+            "⚠️ Останній аргумент має бути телефоном\n"
+            "Приклад: /pb_phone Зарічна 36 0991234567"
+        )
+        return
+
+    addr_query = " ".join(addr_parts)
+
+    # Спробувати знайти існуючий запис за адресою
+    existing = pb_find_by_street(uid, addr_query)
+
+    if existing:
+        # Знайдено — показати і запропонувати оновити перший без телефону
+        no_phone = [e for e in existing if not e[3]]
+        if no_phone:
+            # Оновити перший запис без телефону
+            entry = no_phone[0]
+            pb_update_entry(uid, entry[0], phone=phone)
+            await update.message.reply_text(
+                "✅ Телефон додано:\n"
+                "📍 " + entry[1] + "\n"
+                "👤 " + (entry[2] or '—') + "\n"
+                "📞 " + phone + "\n"
+                "[ID: " + str(entry[0]) + "]"
+            )
+        else:
+            # Всі записи вже мають телефон — додати новий
+            # Визначити вулицю з першого знайденого запису
+            street = existing[0][1]
+            new_id = pb_add_entry(uid, street, None, phone)
+            await update.message.reply_text(
+                "➕ Додано новий запис:\n"
+                "📍 " + street + "\n"
+                "📞 " + phone + "\n"
+                "[ID: " + str(new_id) + "]\n\n"
+                "ℹ️ Існуючі записи за цією адресою вже мали телефони.\n"
+                "Редагувати ПІБ: /pb_edit " + str(new_id) + " name Прізвище Ім'я"
+            )
+    else:
+        # Не знайдено — створити новий запис
+        # Сформувати вулицю з адреси
+        street = "вул. " + addr_query
+        new_id = pb_add_entry(uid, street, None, phone)
+        await update.message.reply_text(
+            "➕ Новий запис додано:\n"
+            "📍 " + street + "\n"
+            "📞 " + phone + "\n"
+            "[ID: " + str(new_id) + "]\n\n"
+            "Додати ПІБ: /pb_edit " + str(new_id) + " name Прізвище Ім'я\n"
+            "Перевірити адресу: /pb_find " + addr_query
+        )
+
 async def cmd_pb_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/pb_edit 42 phone 0991234567  or  /pb_edit 42 name Нова Людина"""
     uid = update.effective_user.id
     if not ctx.args or len(ctx.args) < 3:
         await update.message.reply_text(
@@ -924,7 +980,6 @@ async def cmd_pb_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Поле: phone, name або notes")
 
 async def cmd_pb_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/pb_del 42"""
     uid = update.effective_user.id
     if not ctx.args:
         await update.message.reply_text("🗑 Видалити запис: /pb_del [ID]")
@@ -938,7 +993,6 @@ async def cmd_pb_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Запис [" + str(entry_id) + "] видалено")
 
 async def cmd_pb_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/pb_export — вивантажити xlsx"""
     uid = update.effective_user.id
     msg = await update.message.reply_text("⏳ Формую файл...")
     try:
@@ -967,11 +1021,12 @@ def main():
     app.add_handler(CommandHandler("unpaid",      cmd_unpaid_cmd))
     app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
     app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
-    app.add_handler(CommandHandler("pb_find",   cmd_pb_find))
-    app.add_handler(CommandHandler("pb_add",    cmd_pb_add))
-    app.add_handler(CommandHandler("pb_edit",   cmd_pb_edit))
-    app.add_handler(CommandHandler("pb_del",    cmd_pb_del))
-    app.add_handler(CommandHandler("pb_export", cmd_pb_export))
+    app.add_handler(CommandHandler("pb_find",     cmd_pb_find))
+    app.add_handler(CommandHandler("pb_add",      cmd_pb_add))
+    app.add_handler(CommandHandler("pb_phone",    cmd_pb_phone))
+    app.add_handler(CommandHandler("pb_edit",     cmd_pb_edit))
+    app.add_handler(CommandHandler("pb_del",      cmd_pb_del))
+    app.add_handler(CommandHandler("pb_export",   cmd_pb_export))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
     print("Bot started with DB")
