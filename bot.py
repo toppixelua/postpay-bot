@@ -38,10 +38,16 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS paid_marks (
                     user_id BIGINT NOT NULL,
                     person_key TEXT NOT NULL,
+                    pay_date TEXT NOT NULL,
                     paid_at TIMESTAMP DEFAULT NOW(),
-                    PRIMARY KEY (user_id, person_key)
+                    PRIMARY KEY (user_id, person_key, pay_date)
                 );
             """)
+            # Migrate old paid_marks if needed (no pay_date column)
+            try:
+                cur.execute("ALTER TABLE paid_marks ADD COLUMN IF NOT EXISTS pay_date TEXT NOT NULL DEFAULT ''")
+            except Exception:
+                pass
         conn.commit()
 
 def db_get_vedomosti(uid):
@@ -85,22 +91,30 @@ def db_save_phones(uid, data):
             """, (uid, Json(data)))
         conn.commit()
 
+# paid_marks: person_key + pay_date as composite key
 def db_get_paid(uid):
+    """Returns set of (person_key, pay_date) tuples"""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT person_key FROM paid_marks WHERE user_id=%s", (uid,))
-            return {row[0] for row in cur.fetchall()}
+            cur.execute("SELECT person_key, pay_date FROM paid_marks WHERE user_id=%s", (uid,))
+            return {(row[0], row[1]) for row in cur.fetchall()}
 
-def db_mark_paid(uid, key):
+def db_mark_paid(uid, key, pay_date):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO paid_marks (user_id, person_key) VALUES (%s,%s) ON CONFLICT DO NOTHING", (uid, key))
+            cur.execute(
+                "INSERT INTO paid_marks (user_id, person_key, pay_date) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                (uid, key, pay_date)
+            )
         conn.commit()
 
-def db_unmark_paid(uid, key):
+def db_unmark_paid(uid, key, pay_date=None):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM paid_marks WHERE user_id=%s AND person_key=%s", (uid, key))
+            if pay_date:
+                cur.execute("DELETE FROM paid_marks WHERE user_id=%s AND person_key=%s AND pay_date=%s", (uid, key, pay_date))
+            else:
+                cur.execute("DELETE FROM paid_marks WHERE user_id=%s AND person_key=%s", (uid, key))
         conn.commit()
 
 def db_clear_paid(uid):
@@ -123,21 +137,19 @@ def make_person_key(r):
         return "ACC|" + acc
     return r["name"] + "|" + norm_addr(r.get("address",""))
 
-def find_phone(phone_book, addr):
-    if not phone_book: return ''
-    key = norm_addr(addr)
-    if not key: return ''
-    if key in phone_book: return phone_book[key]
-    for k, v in phone_book.items():
-        if len(key) > 5 and (k.startswith(key) or key.startswith(k)):
-            return v
-    return ''
+def norm_date(s):
+    m = re.match(r'(\d{1,2})[.\-/](\d{1,2})', str(s))
+    if not m: return str(s)
+    return str(int(m.group(1))).zfill(2) + "." + str(int(m.group(2))).zfill(2)
 
 def parse_date(s):
     m = re.match(r'(\d{1,2})[.\-/](\d{1,2})', str(s))
     if not m: return None
     try: return datetime(datetime.now().year, int(m.group(2)), int(m.group(1)))
     except: return None
+
+def today_str():
+    return datetime.now().strftime("%d.%m")
 
 def is_payable_by(pay_date, limit_date):
     d = parse_date(pay_date)
@@ -190,42 +202,63 @@ def build_all_rows(vedomosti, phone_book):
                 "type": v.get("vedomist_type","?"),
                 "dil":  v.get("dilinitsa","?"),
                 "sum":  r.get("sum", 0),
-                "pay_date": r.get("pay_date","?")
+                "pay_date": norm_date(r.get("pay_date","?"))
             })
     return list(grouped.values())
 
-def format_rows(rows, phone_book, paid=None):
-    if paid is None:
-        paid = set()
+def find_phone(phone_book, addr):
+    if not phone_book: return ''
+    key = norm_addr(addr)
+    if not key: return ''
+    if key in phone_book: return phone_book[key]
+    for k, v in phone_book.items():
+        if len(key) > 5 and (k.startswith(key) or key.startswith(k)):
+            return v
+    return ''
+
+def is_person_fully_paid(r, paid_set):
+    key = make_person_key(r)
+    return all((key, v["pay_date"]) in paid_set for v in r["veds"])
+
+def is_ved_paid(r, ved, paid_set):
+    key = make_person_key(r)
+    return (key, ved["pay_date"]) in paid_set
+
+def format_rows(rows, phone_book, paid_set=None):
+    if paid_set is None:
+        paid_set = set()
     chunks = []
     current = ""
     for i, r in enumerate(rows, 1):
-        key     = make_person_key(r)
-        is_paid = key in paid
-        addr    = r["address"].replace("Сошичне, ","").replace(";;","").strip()
-        phone   = r.get("phone","") or find_phone(phone_book, r["address"])
-        account = r.get("account","")
-        veds_str = " ".join(["В" + v["type"] + "·" + v["dil"] for v in r["veds"]])
-        pays_str = " / ".join([fmt_hrn(v.get("sum",0)) + " · " + v["pay_date"] for v in r["veds"]])
+        key       = make_person_key(r)
+        addr      = r["address"].replace("Сошичне, ","").replace(";;","").strip()
+        phone     = r.get("phone","") or find_phone(phone_book, r["address"])
+        account   = r.get("account","")
+        all_paid  = is_person_fully_paid(r, paid_set)
 
-        if is_paid:
+        # Header
+        if all_paid:
             line = str(i) + ". ✅ " + r["name"] + "\n"
-            line += "   📍 " + addr + "\n"
-            line += "   ✔️ Виплачено\n"
-            line += "   💰 " + pays_str + "\n"
-            if account:
-                line += "   🔢 " + account + "\n"
         else:
             line = str(i) + ". " + r["name"] + "\n"
-            line += "   📍 " + addr + "\n"
-            if phone:
-                line += "   📞 " + phone + "\n"
-            line += "   📋 " + veds_str + "\n"
-            line += "   💰 " + pays_str + "\n"
-            line += "   🪪 " + r["passport"] + "\n"
-            if account:
-                line += "   🔢 " + account + "\n"
-        line += "\n"
+        line += "   📍 " + addr + "\n"
+        if phone:
+            line += "   📞 " + phone + "\n"
+        if account:
+            line += "   🔢 " + account + "\n"
+
+        # Each payment
+        for ved in r["veds"]:
+            ved_paid = is_ved_paid(r, ved, paid_set)
+            status = "✅" if ved_paid else "⏳"
+            line += "   " + status + " В" + ved["type"] + "·" + ved["dil"]
+            line += " · " + fmt_hrn(ved.get("sum",0))
+            line += " · 📅 " + ved["pay_date"] + "\n"
+
+        if all_paid:
+            line += "   ✔️ Виплачено\n"
+
+        line += "   🪪 " + r["passport"] + "\n\n"
 
         if len(current) + len(line) > 3800:
             chunks.append(current)
@@ -295,17 +328,19 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📄 Надішли PDF — додається до загального списку\n"
         "📞 Надішли XLSX — завантажує телефонну книгу\n\n"
         "Команди:\n"
-        "/status — скільки відомостей і людей\n"
-        "/list — зведений список всіх\n"
-        "/today 07.06 — виплати до вказаної дати\n"
+        "/status — статус відомостей\n"
+        "/list — зведений список\n"
+        "/today 07.06 — виплати до дати\n"
         "/search Шв — пошук (2+ літери)\n"
         "/multi — отримувачі з 2+ виплатами\n"
         "/clear — очистити відомості\n"
-        "/phones — статус телефонної книги\n\n"
+        "/phones — телефонна книга\n\n"
         "Відмітки виплат:\n"
-        "/paid 001256811781 — відмітити виплачено\n"
-        "/unpaid 001256811781 — зняти позначку\n"
-        "/unpaid_list — список невиплачених\n"
+        "/paid 001256811781 — всі виплати що настали\n"
+        "/paid 001256811781 05.06 — конкретна дата\n"
+        "/unpaid 001256811781 — зняти всі позначки\n"
+        "/unpaid 001256811781 05.06 — зняти по даті\n"
+        "/unpaid_list — невиплачені\n"
         "/clear_paid — зняти всі позначки"
     )
 
@@ -317,15 +352,15 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
     rows = build_all_rows(veds, phones)
-    paid = db_get_paid(uid)
+    paid_set = db_get_paid(uid)
+    total_veds_count = sum(len(r["veds"]) for r in rows)
+    paid_count = sum(1 for r in rows for v in r["veds"] if is_ved_paid(r, v, paid_set))
     total_sum = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in rows)
-    unpaid_count = sum(1 for r in rows if make_person_key(r) not in paid)
     ved_list = "\n".join(["  • В" + v.get("vedomist_type","?") + "·Діл." + v.get("dilinitsa","?") + " — " + str(len(v.get("rows",[]))) + " ос. (" + v.get("period","") + ")" for v in veds])
     await update.message.reply_text(
         "📊 Статус:\n" + ved_list + "\n\n"
         "👥 Унікальних осіб: " + str(len(rows)) + "\n"
-        "✅ Виплачено: " + str(len(rows) - unpaid_count) + "\n"
-        "⏳ Залишилось: " + str(unpaid_count) + "\n"
+        "✅ Виплат здійснено: " + str(paid_count) + "/" + str(total_veds_count) + "\n"
         "💰 Загальна сума: " + fmt_hrn(total_sum) + "\n"
         "📞 Телефонна книга: " + str(len(phones)) + " адрес"
     )
@@ -339,10 +374,10 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     rows = build_all_rows(veds, phones)
     rows.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
-    paid = db_get_paid(uid)
-    unpaid_count = sum(1 for r in rows if make_person_key(r) not in paid)
-    await update.message.reply_text("📋 Зведений список · " + str(len(rows)) + " осіб · не виплачено: " + str(unpaid_count) + "\n" + "─"*28)
-    for chunk in format_rows(rows, phones, paid):
+    paid_set = db_get_paid(uid)
+    unpaid = sum(1 for r in rows if not is_person_fully_paid(r, paid_set))
+    await update.message.reply_text("📋 Зведений список · " + str(len(rows)) + " осіб · не виплачено повністю: " + str(unpaid) + "\n" + "─"*28)
+    for chunk in format_rows(rows, phones, paid_set):
         await update.message.reply_text(chunk)
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -369,11 +404,11 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Немає виплат до " + ctx.args[0])
         return
     filtered.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
-    paid = db_get_paid(uid)
+    paid_set = db_get_paid(uid)
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in filtered)
-    unpaid = sum(1 for r in filtered if make_person_key(r) not in paid)
+    unpaid = sum(1 for r in filtered if not is_person_fully_paid(r, paid_set))
     await update.message.reply_text("📅 Виплати до " + ctx.args[0] + " · " + str(len(filtered)) + " осіб · не виплачено: " + str(unpaid) + "\n💰 " + fmt_hrn(total) + "\n" + "─"*28)
-    for chunk in format_rows(filtered, phones, paid):
+    for chunk in format_rows(filtered, phones, paid_set):
         await update.message.reply_text(chunk)
 
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -394,9 +429,9 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not found:
         await update.message.reply_text("🔍 Нічого не знайдено: " + query)
         return
-    paid = db_get_paid(uid)
+    paid_set = db_get_paid(uid)
     await update.message.reply_text("🔍 '" + query + "' · " + str(len(found)) + " осіб\n" + "─"*28)
-    for chunk in format_rows(found, phones, paid):
+    for chunk in format_rows(found, phones, paid_set):
         await update.message.reply_text(chunk)
 
 async def cmd_multi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -412,10 +447,10 @@ async def cmd_multi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Немає отримувачів з двома і більше виплатами.")
         return
     multi.sort(key=lambda r: r["name"])
-    paid = db_get_paid(uid)
+    paid_set = db_get_paid(uid)
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in multi)
     await update.message.reply_text("👥 Отримувачів з 2+ виплатами: " + str(len(multi)) + "\n💰 Загальна сума: " + fmt_hrn(total) + "\n" + "─"*28)
-    for chunk in format_rows(multi, phones, paid):
+    for chunk in format_rows(multi, phones, paid_set):
         await update.message.reply_text(chunk)
 
 async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -426,9 +461,17 @@ async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Відомостей немає.")
         return
     if not ctx.args:
-        await update.message.reply_text("⚠️ Вкажи номер рахунку або прізвище:\n/paid 001256811781\n/paid Шворак")
+        await update.message.reply_text(
+            "⚠️ Вкажи номер рахунку або прізвище:\n"
+            "/paid 001256811781 — всі виплати що настали\n"
+            "/paid 001256811781 05.06 — конкретна дата"
+        )
         return
-    query = " ".join(ctx.args).strip()
+
+    # Parse args: first arg = account/name, optional second = date
+    query = ctx.args[0].strip()
+    specific_date = norm_date(ctx.args[1]) if len(ctx.args) >= 2 else None
+
     all_rows = build_all_rows(veds, phones)
     found = find_by_account_or_name(all_rows, query)
     if not found:
@@ -438,9 +481,39 @@ async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         names = "\n".join([str(i+1) + ". " + r.get("account","") + " " + r["name"] for i, r in enumerate(found)])
         await update.message.reply_text("Знайдено кілька — вкажи номер рахунку:\n" + names)
         return
+
     r = found[0]
-    db_mark_paid(uid, make_person_key(r))
-    await update.message.reply_text("✅ Виплачено: " + r["name"] + "\n   🔢 " + r.get("account",""))
+    key = make_person_key(r)
+    today = today_str()
+    marked = []
+
+    if specific_date:
+        # Mark specific date
+        matching = [v for v in r["veds"] if norm_date(v["pay_date"]) == specific_date]
+        if not matching:
+            await update.message.reply_text("⚠️ Виплати на " + specific_date + " не знайдено для " + r["name"])
+            return
+        db_mark_paid(uid, key, specific_date)
+        marked = [specific_date]
+    else:
+        # Mark all payable today or earlier
+        limit = parse_date(today)
+        for v in r["veds"]:
+            if is_payable_by(v["pay_date"], limit):
+                db_mark_paid(uid, key, norm_date(v["pay_date"]))
+                marked.append(norm_date(v["pay_date"]))
+
+    if not marked:
+        await update.message.reply_text(
+            "ℹ️ " + r["name"] + "\n"
+            "Немає виплат що настали сьогодні або раніше.\n"
+            "Для дострокової виплати вкажи дату:\n"
+            "/paid " + r.get("account","") + " " + r["veds"][0]["pay_date"] if r["veds"] else ""
+        )
+        return
+
+    dates_str = ", ".join(marked)
+    await update.message.reply_text("✅ Виплачено: " + r["name"] + "\n   🔢 " + r.get("account","") + "\n   📅 " + dates_str)
 
 async def cmd_unpaid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -450,9 +523,12 @@ async def cmd_unpaid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Відомостей немає.")
         return
     if not ctx.args:
-        await update.message.reply_text("⚠️ Вкажи номер рахунку або прізвище:\n/unpaid 001256811781")
+        await update.message.reply_text("⚠️ Вкажи номер рахунку:\n/unpaid 001256811781\n/unpaid 001256811781 05.06")
         return
-    query = " ".join(ctx.args).strip()
+
+    query = ctx.args[0].strip()
+    specific_date = norm_date(ctx.args[1]) if len(ctx.args) >= 2 else None
+
     all_rows = build_all_rows(veds, phones)
     found = find_by_account_or_name(all_rows, query)
     if not found:
@@ -462,9 +538,14 @@ async def cmd_unpaid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         names = "\n".join([str(i+1) + ". " + r.get("account","") + " " + r["name"] for i, r in enumerate(found)])
         await update.message.reply_text("Знайдено кілька — вкажи номер рахунку:\n" + names)
         return
+
     r = found[0]
-    db_unmark_paid(uid, make_person_key(r))
-    await update.message.reply_text("↩️ Знято позначку: " + r["name"] + "\n   🔢 " + r.get("account",""))
+    key = make_person_key(r)
+    db_unmark_paid(uid, key, specific_date)
+    if specific_date:
+        await update.message.reply_text("↩️ Знято позначку: " + r["name"] + " · " + specific_date)
+    else:
+        await update.message.reply_text("↩️ Знято всі позначки: " + r["name"])
 
 async def cmd_unpaid_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -474,15 +555,20 @@ async def cmd_unpaid_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Відомостей немає.")
         return
     all_rows = build_all_rows(veds, phones)
-    paid = db_get_paid(uid)
-    unpaid = [r for r in all_rows if make_person_key(r) not in paid]
+    paid_set = db_get_paid(uid)
+    # Show people with at least one unpaid ved
+    unpaid = []
+    for r in all_rows:
+        unpaid_veds = [v for v in r["veds"] if not is_ved_paid(r, v, paid_set)]
+        if unpaid_veds:
+            unpaid.append(dict(r, veds=unpaid_veds))
     unpaid.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
     if not unpaid:
         await update.message.reply_text("🎉 Всі виплати здійснено!")
         return
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in unpaid)
     await update.message.reply_text("⏳ Не виплачено · " + str(len(unpaid)) + " осіб · " + fmt_hrn(total) + "\n" + "─"*28)
-    for chunk in format_rows(unpaid, phones, paid):
+    for chunk in format_rows(unpaid, phones, paid_set):
         await update.message.reply_text(chunk)
 
 async def cmd_clear_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -565,9 +651,9 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if veds:
             found = [r for r in build_all_rows(veds, phones) if text in r["name"].upper()]
             if found:
-                paid = db_get_paid(uid)
+                paid_set = db_get_paid(uid)
                 await update.message.reply_text("🔍 '" + update.message.text.strip() + "' · " + str(len(found)) + " осіб\n" + "─"*28)
-                for chunk in format_rows(found, phones, paid):
+                for chunk in format_rows(found, phones, paid_set):
                     await update.message.reply_text(chunk)
                 return
     await update.message.reply_text(
