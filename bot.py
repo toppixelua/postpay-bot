@@ -5,6 +5,7 @@ import openpyxl
 import psycopg2
 from psycopg2.extras import Json
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
@@ -150,6 +151,11 @@ def fmt_hrn(n):
     try: return f"{float(n):,.2f} ₴".replace(',', ' ')
     except: return str(n)
 
+def esc(text):
+    """Escape special chars for MarkdownV2 - only for non-bold plain text"""
+    chars = r'_[]()~`>#+-=|{}.!'
+    return ''.join(f'\{c}' if c in chars else c for c in str(text))
+
 def parse_xlsx(data: bytes) -> dict:
     wb = openpyxl.load_workbook(io.BytesIO(data))
     ws = wb.active
@@ -212,11 +218,15 @@ def format_rows(rows, phone_book, paid=None):
         account = r.get("account","")
         acc_str = f"   🔢 {account}\n" if account else ""
         if is_paid:
-            line = f"{i}. ✅ {r['name']}\n   📍 {addr}\n   💰 {pays_str}\n{acc_str}\n"
+            line = (f"{esc(i)}\. ✅ *{esc(r['name'])}*\n"
+                    f"   📍 {esc(addr)}\n"
+                    f"   ✔️ *Виплачено*\n"
+                    f"   💰 {esc(pays_str)}\n"
+                    f"   🔢 {esc(account)}\n\n")
         else:
-            line = f"{i}. {r['name']}\n   📍 {addr}\n"
-            if phone: line += f"   📞 {phone}\n"
-            line += f"   📋 {veds_str}\n   💰 {pays_str}\n   🪪 {r['passport']}\n{acc_str}\n"
+            line = f"{esc(i)}\. {esc(r['name'])}\n   📍 {esc(addr)}\n"
+            if phone: line += f"   📞 {esc(phone)}\n"
+            line += f"   📋 {esc(veds_str)}\n   💰 {esc(pays_str)}\n   🪪 {esc(r['passport'])}\n{esc(acc_str)}\n"
 
         if len(current) + len(line) > 3800:
             chunks.append(current)
@@ -314,7 +324,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     unpaid_count = sum(1 for r in rows if make_person_key(r) not in paid)
     await update.message.reply_text(f"📋 Зведений список · {len(rows)} осіб · не виплачено: {unpaid_count}\n{'─'*28}")
     for chunk in format_rows(rows, phones, paid):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN_V2)
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -345,7 +355,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     unpaid = sum(1 for r in filtered if make_person_key(r) not in paid)
     await update.message.reply_text(f"📅 Виплати до {ctx.args[0]} · {len(filtered)} осіб · не виплачено: {unpaid}\n💰 {fmt_hrn(total)}\n{'─'*28}")
     for chunk in format_rows(filtered, phones, paid):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN_V2)
 
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -368,7 +378,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     paid = db_get_paid(uid)
     await update.message.reply_text(f"🔍 '{query}' · {len(found)} осіб\n{'─'*28}")
     for chunk in format_rows(found, phones, paid):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN_V2)
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -540,7 +550,7 @@ async def cmd_unpaid_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in unpaid)
     await update.message.reply_text(f"⏳ Не виплачено · {len(unpaid)} осіб · {fmt_hrn(total)}\n{'─'*28}")
     for chunk in format_rows(unpaid, phones, paid):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN_V2)
 
 async def cmd_clear_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
