@@ -737,14 +737,28 @@ def pb_import_xlsx(uid, data: bytes):
         conn.commit()
     return len(entries)
 
+def norm_search(q):
+    """Normalize search query for flexible matching"""
+    # Remove spaces around commas, normalize spaces
+    q = q.strip().lower()
+    q = q.replace(', ', ',').replace(' ,', ',')
+    return q
+
 def pb_find_by_street(uid, street_query):
-    """Find entries by partial street match"""
+    """Find entries by partial street match - flexible"""
+    q = norm_search(street_query)
+    # Also try without spaces between street name and number
+    q_nospace = q.replace(' ', '')
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, street, name, phone, notes FROM pb_entries WHERE user_id=%s AND LOWER(street) LIKE %s ORDER BY street, id",
-                (uid, '%' + street_query.lower() + '%')
-            )
+            cur.execute("""
+                SELECT id, street, name, phone, notes FROM pb_entries
+                WHERE user_id=%s AND (
+                    LOWER(REPLACE(REPLACE(street, ' ', ''), ',', '')) LIKE %s
+                    OR LOWER(street) LIKE %s
+                )
+                ORDER BY street, id
+            """, (uid, '%' + q_nospace + '%', '%' + q + '%'))
             return cur.fetchall()
 
 def pb_find_by_name(uid, name_query):
