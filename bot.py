@@ -11,6 +11,26 @@ BOT_TOKEN     = os.environ["BOT_TOKEN"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 
+# ── Назви типів відомостей ────────────────────────────────────────────────────
+VED_NAMES = {
+    "01": "Пенсія",
+    "02": "Доплата до пенсії",
+    "13": "Одноразова допомога дітей",
+    "14": "Соціальна допомога до пенсії",
+    "28": "Допомога по догляду",
+    "30": "Компенсація дітям від ЧАЕС",
+    "32": "Компенсація за харчування",
+    "52": "Багатодітним",
+    "57": "Малозабезпечені сім'ї",
+    "58": "З інвалідністю дитинства",
+    "98": "Житлова субсидія",
+    "99": "Пільги",
+}
+
+def ved_name(type_str):
+    t = re.sub(r'[^0-9]', '', str(type_str or '')).zfill(2)
+    return VED_NAMES.get(t, "В" + t)
+
 # ── Database ──────────────────────────────────────────────────────────────────
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -384,13 +404,20 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_veds_count = sum(len(r["veds"]) for r in rows)
     paid_count = sum(1 for r in rows for v in r["veds"] if is_ved_paid(r, v, paid_set))
     total_sum = sum(sum(float(v.get("sum",0)) for v in r["veds"]) for r in rows)
-    ved_list = "\n".join(["  • В" + v.get("vedomist_type","?") + "·Діл." + v.get("dilinitsa","?") + " — " + str(len(v.get("rows",[]))) + " ос. (" + v.get("period","") + ")" for v in veds])
+    ved_list = "\n".join([
+        "  • В" + v.get("vedomist_type","?") + " " + ved_name(v.get("vedomist_type","")) +
+        " ·Діл." + v.get("dilinitsa","?") +
+        " — " + str(len(v.get("rows",[]))) + " ос. (" + v.get("period","") + ")"
+        "  →  /list " + re.sub(r'[^0-9]','',v.get("vedomist_type","?"))
+        for v in veds
+    ])
     await update.message.reply_text(
         "📊 Статус:\n" + ved_list + "\n\n"
         "👥 Унікальних осіб: " + str(len(rows)) + "\n"
         "✅ Виплат здійснено: " + str(paid_count) + "/" + str(total_veds_count) + "\n"
         "💰 Загальна сума: " + fmt_hrn(total_sum) + "\n"
-        "📞 Телефонна книга: " + str(len(phones)) + " адрес"
+        "📞 Телефонна книга: " + str(len(phones)) + " адрес\n\n"
+        "Фільтр: /list · /list В01 · /list 50 · /list В01 50"
     )
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -400,11 +427,69 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not veds:
         await update.message.reply_text("📭 Відомостей немає. Надішли PDF.")
         return
-    rows = build_all_rows(veds, phones, uid=uid)
+
+    # Парсимо аргументи фільтру: /list [тип] [дільниця]
+    # Приклади: /list В01  /list 50  /list В01 50  /list 1 50
+    filter_type = None
+    filter_dil  = None
+    if ctx.args:
+        for arg in ctx.args:
+            a = arg.upper().lstrip('ВB')  # strip В/B prefix
+            # Якщо це число — може бути тип або дільниця
+            # Визначаємо: якщо вже є filter_type — це дільниця, інакше тип
+            raw = re.sub(r'[^0-9]', '', arg)
+            if arg.upper().startswith(('В', 'B')):
+                filter_type = raw
+            elif raw:
+                if filter_type is None:
+                    filter_type = raw
+                else:
+                    filter_dil = raw
+            else:
+                # не число — спробувати як дільницю (Діл.50 → 50)
+                m = re.search(r'\d+', arg)
+                if m:
+                    filter_dil = m.group()
+
+    # Якщо є фільтр — відфільтрувати відомості
+    if filter_type or filter_dil:
+        filtered_veds = []
+        for v in veds:
+            match_type = (not filter_type) or (re.sub(r'[^0-9]','', v.get("vedomist_type","")) == filter_type)
+            match_dil  = (not filter_dil)  or (re.sub(r'[^0-9]','', v.get("dilinitsa",""))  == filter_dil)
+            if match_type and match_dil:
+                filtered_veds.append(v)
+        if not filtered_veds:
+            # Показати доступні відомості
+            ved_list = "\n".join([
+                "  /list " + re.sub(r'[^0-9]','',v.get("vedomist_type","?")) +
+                " — В" + v.get("vedomist_type","?") + " " + ved_name(v.get("vedomist_type","")) +
+                " ·Діл." + v.get("dilinitsa","?") +
+                " · " + str(len(v.get("rows",[]))) + " ос."
+                for v in veds
+            ])
+            await update.message.reply_text(
+                "🔍 Нічого не знайдено за фільтром.\n\n"
+                "Доступні відомості:\n" + ved_list +
+                "\n\nПриклади: /list 52 · /list 99 · /list 01"
+            )
+            return
+        if filter_type:
+            label = "В" + filter_type + " " + ved_name(filter_type)
+        else:
+            label = ""
+        if filter_dil: label += ("·" if label else "") + "Діл." + filter_dil
+        veds_to_show = filtered_veds
+    else:
+        label = "зведений"
+        veds_to_show = veds
+
+    rows = build_all_rows(veds_to_show, phones, uid=uid)
     rows.sort(key=lambda r: r["veds"][0].get("pay_date","99.99"))
     paid_set = db_get_paid(uid)
     unpaid = sum(1 for r in rows if not is_person_fully_paid(r, paid_set))
-    await update.message.reply_text("📋 Зведений список · " + str(len(rows)) + " осіб · не виплачено повністю: " + str(unpaid) + "\n" + "─"*28)
+    header = "📋 Список " + label + " · " + str(len(rows)) + " осіб · не виплачено: " + str(unpaid) + "\n" + "─"*28
+    await update.message.reply_text(header)
     for chunk in format_rows(rows, phones, paid_set, uid=uid):
         await update.message.reply_text(chunk)
 
