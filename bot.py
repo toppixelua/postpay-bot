@@ -62,6 +62,13 @@ def init_db():
                     paid_at TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (user_id, person_key, pay_date)
                 );
+                CREATE TABLE IF NOT EXISTS account_links (
+                    user_id BIGINT NOT NULL,
+                    account TEXT NOT NULL,
+                    pb_entry_id INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (user_id, account)
+                );
             """)
             try:
                 cur.execute("ALTER TABLE paid_marks ADD COLUMN IF NOT EXISTS pay_date TEXT NOT NULL DEFAULT ''")
@@ -140,6 +147,40 @@ def db_clear_paid(uid):
             cur.execute("DELETE FROM paid_marks WHERE user_id=%s", (uid,))
         conn.commit()
 
+# ── Account links ─────────────────────────────────────────────────────────────
+def db_link_account(uid, account, pb_entry_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO account_links (user_id, account, pb_entry_id)
+                VALUES (%s,%s,%s)
+                ON CONFLICT (user_id, account) DO UPDATE SET pb_entry_id=EXCLUDED.pb_entry_id, created_at=NOW()
+            """, (uid, account, pb_entry_id))
+        conn.commit()
+
+def db_unlink_account(uid, account):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM account_links WHERE user_id=%s AND account=%s", (uid, account))
+        conn.commit()
+
+def db_get_links(uid):
+    """Повертає dict {account: pb_entry_id}"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT account, pb_entry_id FROM account_links WHERE user_id=%s", (uid,))
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+def db_get_pb_entry(uid, entry_id):
+    """Отримати один запис pb_entries по id"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, street, name, phone, notes FROM pb_entries WHERE id=%s AND user_id=%s",
+                (entry_id, uid)
+            )
+            return cur.fetchone()
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def norm_addr(addr):
     return re.sub(r'[^А-ЯІЇЄҐа-яіїєґA-Za-z0-9]', '',
@@ -201,21 +242,31 @@ def extract_json(text):
         except: pass
     return None
 
-# ── ОНОВЛЕНО: find_phone тепер шукає в pb_entries (нова таблиця) + fallback на старий dict ──
-def find_phone(phone_book, addr, uid=None):
-    """Шукає телефон спочатку в pb_entries (по uid), потім у старому phone_book dict"""
-    # 1) Пошук у новій таблиці pb_entries
+# ── find_phone: account_links → pb_entries → старий dict ──
+def find_phone(phone_book, addr, uid=None, account=None, links=None):
+    """Шукає телефон: 1) по прив'язці account→pb_entry, 2) по адресі в pb_entries, 3) старий dict"""
+    # 1) Пряма прив'язка account → pb_entry_id
+    if uid is not None and account and links:
+        entry_id = links.get(str(account).strip())
+        if entry_id:
+            try:
+                entry = db_get_pb_entry(uid, entry_id)
+                if entry and entry[3] and entry[3].strip():
+                    return entry[3].strip()
+            except Exception:
+                pass
+
+    # 2) Пошук по адресі в pb_entries
     if uid is not None:
         try:
             entries = pb_find_by_street(uid, addr)
-            # Повертаємо перший телефон що знайдено
             for eid, street, name, phone, notes in entries:
                 if phone and phone.strip():
                     return phone.strip()
         except Exception:
             pass
 
-    # 2) Fallback на старий phone_book dict
+    # 3) Fallback на старий phone_book dict
     if not phone_book:
         return ''
     key = norm_addr(addr)
@@ -229,17 +280,21 @@ def find_phone(phone_book, addr, uid=None):
     return ''
 
 def build_all_rows(vedomosti, phone_book, uid=None):
+    # Завантажити прив'язки один раз
+    links = db_get_links(uid) if uid is not None else {}
     grouped = {}
     for v in vedomosti:
         for r in v.get("rows", []):
             key = make_person_key(r)
+            acc = str(r.get("account","") or "").strip()
             if key not in grouped:
                 grouped[key] = {
                     "name": r["name"],
                     "address": r.get("address",""),
                     "passport": r.get("passport",""),
-                    "account": r.get("account",""),
-                    "phone": find_phone(phone_book, r.get("address",""), uid=uid),
+                    "account": acc,
+                    "phone": find_phone(phone_book, r.get("address",""), uid=uid, account=acc, links=links),
+                    "linked": acc in links,
                     "veds": []
                 }
             grouped[key]["veds"].append({
@@ -270,13 +325,15 @@ def format_rows(rows, phone_book, paid_set=None, uid=None):
         account   = r.get("account","")
         all_paid  = is_person_fully_paid(r, paid_set)
 
+        linked = r.get("linked", False)
         if all_paid:
             line = str(i) + ". ✅ " + r["name"] + "\n"
         else:
             line = str(i) + ". " + r["name"] + "\n"
         line += "   📍 " + addr + "\n"
         if phone:
-            line += "   📞 " + phone + "\n"
+            link_icon = "🔗" if linked else "📞"
+            line += "   " + link_icon + " " + phone + "\n"
         if account:
             line += "   🔢 " + account + "\n"
 
@@ -1091,6 +1148,74 @@ async def cmd_pb_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text("❌ Помилка: " + str(e)[:300])
 
+async def cmd_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/link 907540199004 748 — прив'язати рахунок до запису телефонної книги"""
+    uid = update.effective_user.id
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text(
+            "🔗 Прив'язати рахунок до телефонної книги:\n"
+            "/link [рахунок] [ID запису]\n\n"
+            "Приклад:\n"
+            "/link 907540199004 748\n\n"
+            "ID запису видно після /pb_find"
+        )
+        return
+    account = ctx.args[0].strip()
+    try:
+        entry_id = int(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID запису має бути числом")
+        return
+
+    # Перевірити що запис існує
+    entry = db_get_pb_entry(uid, entry_id)
+    if not entry:
+        await update.message.reply_text("⚠️ Запис [" + str(entry_id) + "] не знайдено в телефонній книзі")
+        return
+
+    db_link_account(uid, account, entry_id)
+    phone = entry[3] or "—"
+    name  = entry[2] or "—"
+    await update.message.reply_text(
+        "🔗 Прив'язано:\n"
+        "🔢 Рахунок: " + account + "\n"
+        "📍 " + entry[1] + "\n"
+        "👤 " + name + "\n"
+        "📞 " + phone + "\n"
+        "[ID: " + str(entry_id) + "]"
+    )
+
+async def cmd_unlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/unlink 907540199004 — зняти прив'язку рахунку"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("🔗 Зняти прив'язку: /unlink [рахунок]")
+        return
+    account = ctx.args[0].strip()
+    db_unlink_account(uid, account)
+    await update.message.reply_text("↩️ Прив'язку знято для рахунку: " + account)
+
+async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/links — показати всі прив'язки"""
+    uid = update.effective_user.id
+    links = db_get_links(uid)
+    if not links:
+        await update.message.reply_text(
+            "🔗 Прив'язок немає.\n\n"
+            "Додати: /link [рахунок] [ID з /pb_find]"
+        )
+        return
+    lines = ["🔗 Прив'язки рахунків (" + str(len(links)) + "):"]
+    for account, entry_id in sorted(links.items()):
+        entry = db_get_pb_entry(uid, entry_id)
+        if entry:
+            phone = entry[3] or "—"
+            name  = entry[2] or "—"
+            lines.append("  " + account + " → [" + str(entry_id) + "] " + name + " · 📞 " + phone)
+        else:
+            lines.append("  " + account + " → [" + str(entry_id) + "] (запис видалено)")
+    await update.message.reply_text("\n".join(lines)[:4000])
+
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -1106,6 +1231,9 @@ def main():
     app.add_handler(CommandHandler("unpaid",      cmd_unpaid_cmd))
     app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
     app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
+    app.add_handler(CommandHandler("link",        cmd_link))
+    app.add_handler(CommandHandler("unlink",      cmd_unlink))
+    app.add_handler(CommandHandler("links",       cmd_links))
     app.add_handler(CommandHandler("pb_find",     cmd_pb_find))
     app.add_handler(CommandHandler("pb_add",      cmd_pb_add))
     app.add_handler(CommandHandler("pb_phone",    cmd_pb_phone))
