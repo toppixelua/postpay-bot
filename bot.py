@@ -242,29 +242,38 @@ def extract_json(text):
         except: pass
     return None
 
-# ── find_phone: account_links → pb_entries → старий dict ──
-def find_phone(phone_book, addr, uid=None, account=None, links=None):
-    """Шукає телефон: 1) по прив'язці account→pb_entry, 2) по адресі в pb_entries, 3) старий dict"""
-    # 1) Пряма прив'язка account → pb_entry_id
-    if uid is not None and account and links:
-        entry_id = links.get(str(account).strip())
-        if entry_id:
-            try:
-                entry = db_get_pb_entry(uid, entry_id)
-                if entry and entry[3] and entry[3].strip():
-                    return entry[3].strip()
-            except Exception:
-                pass
+# ── Завантажити всі pb_entries одним запитом ─────────────────────────────────
+def db_get_all_pb_entries(uid):
+    """Повертає {entry_id: (id, street, name, phone, notes)} та list для адресного пошуку"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, street, name, phone, notes FROM pb_entries WHERE user_id=%s ORDER BY street, id",
+                (uid,)
+            )
+            rows = cur.fetchall()
+    by_id = {r[0]: r for r in rows}
+    return by_id, rows
 
-    # 2) Пошук по адресі в pb_entries
-    if uid is not None:
-        try:
-            entries = pb_find_by_street(uid, addr)
-            for eid, street, name, phone, notes in entries:
-                if phone and phone.strip():
-                    return phone.strip()
-        except Exception:
-            pass
+# ── find_phone: account_links → pb_entries (кеш) → старий dict ───────────────
+def find_phone(phone_book, addr, account=None, links=None, pb_by_id=None, pb_all=None):
+    """Шукає телефон з кешу: 1) прив'язка, 2) адреса в pb_entries, 3) старий dict"""
+    # 1) Пряма прив'язка account → pb_entry_id
+    if account and links and pb_by_id:
+        entry_id = links.get(str(account).strip())
+        if entry_id and entry_id in pb_by_id:
+            phone = pb_by_id[entry_id][3]
+            if phone and phone.strip():
+                return phone.strip()
+
+    # 2) Пошук по адресі в кеші pb_entries
+    if pb_all:
+        q = strip_addr(addr)
+        if q:
+            for eid, street, name, phone, notes in pb_all:
+                if q in strip_addr(street):
+                    if phone and phone.strip():
+                        return phone.strip()
 
     # 3) Fallback на старий phone_book dict
     if not phone_book:
@@ -280,8 +289,10 @@ def find_phone(phone_book, addr, uid=None, account=None, links=None):
     return ''
 
 def build_all_rows(vedomosti, phone_book, uid=None):
-    # Завантажити прив'язки один раз
+    # Завантажити все одним запитом
     links = db_get_links(uid) if uid is not None else {}
+    pb_by_id, pb_all = db_get_all_pb_entries(uid) if uid is not None else ({}, [])
+
     grouped = {}
     for v in vedomosti:
         for r in v.get("rows", []):
@@ -293,7 +304,9 @@ def build_all_rows(vedomosti, phone_book, uid=None):
                     "address": r.get("address",""),
                     "passport": r.get("passport",""),
                     "account": acc,
-                    "phone": find_phone(phone_book, r.get("address",""), uid=uid, account=acc, links=links),
+                    "phone": find_phone(phone_book, r.get("address",""),
+                                        account=acc, links=links,
+                                        pb_by_id=pb_by_id, pb_all=pb_all),
                     "linked": acc in links,
                     "veds": []
                 }
@@ -321,7 +334,7 @@ def format_rows(rows, phone_book, paid_set=None, uid=None):
     for i, r in enumerate(rows, 1):
         key       = make_person_key(r)
         addr      = r["address"].replace("Сошичне, ","").replace(";;","").strip()
-        phone     = r.get("phone","") or find_phone(phone_book, r["address"], uid=uid)
+        phone     = r.get("phone","")  # вже підтягнуто в build_all_rows
         account   = r.get("account","")
         all_paid  = is_person_fully_paid(r, paid_set)
 
@@ -377,15 +390,16 @@ async def ask_claude(b64):
     prompt = (
         "Це відомість ПФУ на виплату пенсій. Зчитай всі рядки таблиці з УСІХ сторінок.\n"
         "Поверни ТІЛЬКИ валідний JSON без markdown, без пояснень:\n"
-        '{"vedomist_type":"99","period":"Червень 2026 01","dilinitsa":"50","rows":[{"account":"001256811781","name":"БАЛЕЦЬКИЙ ВОЛОДИМИР ПОРФИРІЙОВИЧ","address":"Сошичне, МИРУ, 94;;","sum":2301.28,"passport":"AC 000393421","pay_date":"04.06"}]}\n'
-        "- account: номер особового рахунку з першої колонки\n"
+        '{"vedomist_type":"99","period":"Червень 2026 01","dilinitsa":"50","rows":[{"account":"001490548552","name":"ГУБЧИК ОЛЕКСАНДР ВАСИЛЬОВИЧ","address":"Сошичне, ПЕРЕМОГИ, 75;;6","sum":518.40,"passport":"AC 000901638","pay_date":"05.06"}]}\n'
+        "- account: номер особового рахунку з першої колонки — ЗАВЖДИ РІВНО 12 ЦИФР, переписуй уважно всі цифри до кінця\n"
         "- vedomist_type: число з рядка Тип виплати\n"
         "- dilinitsa: перший номер після назви села\n"
         "- period: текст після слова період\n"
         "- name: ПІБ ВЕЛИКИМИ ЛІТЕРАМИ\n"
         "- address: адреса як є\n"
         "- sum: число\n"
-        "- pay_date: DD.MM"
+        "- pay_date: DD.MM\n"
+        "ВАЖЛИВО: account завжди складається з 12 цифр. Якщо порахував менше — передивись ще раз."
     )
     async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
@@ -416,6 +430,10 @@ async def ask_claude(b64):
             raise ValueError("JSON не знайдено. Відповідь: " + text[:300])
         if not isinstance(parsed.get("rows"), list):
             parsed["rows"] = []
+        # Перевірити довжину рахунків
+        bad = [r.get("account","") for r in parsed["rows"] if r.get("account") and len(str(r["account"])) != 12]
+        if bad:
+            print("⚠️ Рахунки не 12 цифр:", bad[:5])
         return parsed
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -595,7 +613,10 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(query) < 2:
         await update.message.reply_text("⚠️ Мінімум 2 літери")
         return
-    found = [r for r in build_all_rows(veds, phones, uid=uid) if query in r["name"].upper()]
+    all_rows = build_all_rows(veds, phones, uid=uid)
+    found = [r for r in all_rows if query in r["name"].upper()
+             or query in r.get("address","").upper().replace("СОШИЧНЕ, ","")
+             or query in r.get("account","").upper()]
     if not found:
         await update.message.reply_text("🔍 Нічого не знайдено: " + query)
         return
@@ -813,7 +834,10 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         veds = db_get_vedomosti(uid)
         phones = db_get_phones(uid)
         if veds:
-            found = [r for r in build_all_rows(veds, phones, uid=uid) if text in r["name"].upper()]
+            all_rows = build_all_rows(veds, phones, uid=uid)
+            found = [r for r in all_rows if text in r["name"].upper()
+                     or text in r.get("address","").upper().replace("СОШИЧНЕ, ","")
+                     or text in r.get("account","").upper()]
             if found:
                 paid_set = db_get_paid(uid)
                 await update.message.reply_text("🔍 '" + update.message.text.strip() + "' · " + str(len(found)) + " осіб\n" + "─"*28)
@@ -1148,6 +1172,53 @@ async def cmd_pb_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text("❌ Помилка: " + str(e)[:300])
 
+async def cmd_fix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/fix [рахунок] [поле] [значення] — виправити дані у відомості"""
+    uid = update.effective_user.id
+    if not ctx.args or len(ctx.args) < 3:
+        await update.message.reply_text(
+            "✏️ Виправити дані у відомості:\n"
+            "/fix [рахунок] name ПРІЗВИЩЕ ІМ'Я ПО-БАТЬКОВІ\n"
+            "/fix [рахунок] address Сошичне, ВУЛИЦЯ, 5;;\n"
+            "/fix [рахунок] passport АС 000123456\n\n"
+            "Рахунок видно у списку після 🔢"
+        )
+        return
+
+    account = ctx.args[0].strip()
+    field   = ctx.args[1].lower()
+    value   = " ".join(ctx.args[2:]).strip()
+
+    if field not in ("name", "address", "passport"):
+        await update.message.reply_text("⚠️ Поле: name, address або passport")
+        return
+
+    # Знайти всі відомості де є цей рахунок і оновити
+    veds = db_get_vedomosti(uid)
+    updated = 0
+    for v in veds:
+        rows = v.get("rows", [])
+        changed = False
+        for r in rows:
+            if str(r.get("account","")).strip() == account:
+                r[field] = value if field != "name" else value.upper()
+                changed = True
+                updated += 1
+        if changed:
+            v["rows"] = rows
+            db_save_vedomist(uid, v)
+
+    if updated == 0:
+        await update.message.reply_text("🔍 Рахунок не знайдено: " + account)
+        return
+
+    field_ua = {"name": "ПІБ", "address": "Адреса", "passport": "Паспорт"}
+    await update.message.reply_text(
+        "✅ Виправлено в " + str(updated) + " записах:\n"
+        "🔢 " + account + "\n"
+        "  " + field_ua[field] + ": " + value
+    )
+
 async def cmd_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/link 907540199004 748 — прив'язати рахунок до запису телефонної книги"""
     uid = update.effective_user.id
@@ -1231,6 +1302,7 @@ def main():
     app.add_handler(CommandHandler("unpaid",      cmd_unpaid_cmd))
     app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
     app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
+    app.add_handler(CommandHandler("fix",         cmd_fix))
     app.add_handler(CommandHandler("link",        cmd_link))
     app.add_handler(CommandHandler("unlink",      cmd_unlink))
     app.add_handler(CommandHandler("links",       cmd_links))
