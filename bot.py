@@ -1172,6 +1172,53 @@ async def cmd_pb_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text("❌ Помилка: " + str(e)[:300])
 
+async def cmd_fixstreet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/fixstreet [помилкова] [правильна] — виправити назву вулиці у всіх відомостях"""
+    uid = update.effective_user.id
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text(
+            "✏️ Виправити назву вулиці у всіх відомостях:\n"
+            "/fixstreet [помилкова] [правильна]\n\n"
+            "Приклад:\n"
+            "/fixstreet ПЕРЕМОРГИ ПЕРЕМОГИ\n"
+            "/fixstreet ШКОЛЬНА ШКІЛЬНА\n\n"
+            "Регістр не важливий. Замінює у всіх записах де є ця вулиця."
+        )
+        return
+
+    wrong   = ctx.args[0].upper().strip()
+    correct = ctx.args[1].upper().strip()
+
+    veds = db_get_vedomosti(uid)
+    total_fixed = 0
+    for v in veds:
+        rows = v.get("rows", [])
+        changed = False
+        for r in rows:
+            addr = str(r.get("address", ""))
+            if wrong in addr.upper():
+                # Замінити з урахуванням регістру
+                import re as _re
+                r["address"] = _re.sub(wrong, correct, addr.upper())
+                changed = True
+                total_fixed += 1
+        if changed:
+            v["rows"] = rows
+            db_save_vedomist(uid, v)
+
+    if total_fixed == 0:
+        await update.message.reply_text(
+            "🔍 Не знайдено жодного запису з вулицею: " + wrong + "\n\n"
+            "Перевір написання — пошук по частині назви теж працює."
+        )
+        return
+
+    await update.message.reply_text(
+        "✅ Виправлено " + str(total_fixed) + " записів:\n"
+        "  " + wrong + " → " + correct + "\n\n"
+        "Тепер пошук по адресі має знаходити телефон."
+    )
+
 async def cmd_fix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/fix [рахунок] [поле] [значення] — виправити дані у відомості"""
     uid = update.effective_user.id
@@ -1303,6 +1350,7 @@ def main():
     app.add_handler(CommandHandler("unpaid_list", cmd_unpaid_list))
     app.add_handler(CommandHandler("clear_paid",  cmd_clear_paid))
     app.add_handler(CommandHandler("fix",         cmd_fix))
+    app.add_handler(CommandHandler("fixstreet",   cmd_fixstreet))
     app.add_handler(CommandHandler("link",        cmd_link))
     app.add_handler(CommandHandler("unlink",      cmd_unlink))
     app.add_handler(CommandHandler("links",       cmd_links))
